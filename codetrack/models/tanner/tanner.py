@@ -66,9 +66,22 @@ class AdaptiveTannerGraph(nn.Module):
         self.q_proj = nn.Linear(check_dim, check_dim)
         self.k_proj = nn.Linear(check_dim, check_dim)
 
-        # check node embedding: codebook parity -> check space
-        self.parity_to_check = nn.Linear(code_dim, check_dim)
+        # NOTE: there is deliberately no ``parity_to_check`` projection here anymore.
+        # It used to be summed into ``checks`` while ``VisualSyndrome`` compared the same
+        # ``checks`` against ``parity_ref(parity)`` -- the reference was then present on
+        # both sides of the comparison.  A linear layer kept only to be unused would just
+        # be dead parameters, so it is removed together with the shortcut.
         self.check_norm = nn.LayerNorm(check_dim)
+        # The semantic (A_vv) term is *context*, not evidence, and it is the noisiest
+        # thing in the check: it is a pooling of 128 randomly-initialised node embeddings.
+        # Measured, the corruption evidence in ``obs`` correlates with the true per-check
+        # density at r=0.64, but at `sem_gate = 0.5` the semantic noise is the same size as
+        # the signal and the syndrome head converges to a constant instead.  The gate
+        # therefore starts fully closed (sigmoid(-4) ~ 0.018) and only opens if it earns
+        # its place -- the semantic path is additive context, the H path is the syndrome.
+        self.sem_gate = nn.Parameter(torch.tensor(-4.0))
+        # how strongly the *pre-normalisation* residual enters the syndrome
+        self.residual_scale = nn.Parameter(torch.tensor(1.0))
 
         # 16 check slots pool the graph-node features (soft, learnable topology)
         self.slot_weight = nn.Parameter(torch.rand(num_parity, self.num_graph_nodes))
@@ -79,7 +92,8 @@ class AdaptiveTannerGraph(nn.Module):
                 parity: torch.Tensor, priority: Optional[torch.Tensor] = None,
                 variables_tir: Optional[torch.Tensor] = None,
                 H: Optional[torch.Tensor] = None,
-                observation: Optional[torch.Tensor] = None
+                observation: Optional[torch.Tensor] = None,
+                expected_obs: Optional[torch.Tensor] = None
                 ) -> Dict[str, torch.Tensor]:
         """``variables``: ``B x 256 x 768``; ``identity``/``parity``: ``B x 16 x 256``.
 
@@ -92,6 +106,9 @@ class AdaptiveTannerGraph(nn.Module):
         ``priority`` (``B x 256``, from the target candidate selector) is added to the
         internal identity score when choosing which nodes become graph nodes.
         ``variables_tir`` makes the graph react to corruption in **either** modality.
+        ``expected_obs`` (``B x M x check_dim``) is what the **trusted** identity predicts
+        for the same aggregation; ``check_residual`` is the pre-normalisation difference
+        against it, which is what the syndrome head reads.
         """
         b, n, d = variables.shape
 
@@ -128,13 +145,43 @@ class AdaptiveTannerGraph(nn.Module):
         # Primary term: the parity observation aggregated through the SHARED H, i.e. what
         # the code says the checks should see.  The A_vv term adds semantic context only;
         # it is an auxiliary variable-variable graph, not a second check matrix.
+        #
+        # The reference parity is deliberately NOT added here.  ``VisualSyndrome``
+        # already compares ``checks`` against ``parity_ref(parity)``; feeding parity into
+        # both sides let the discrepancy be computed against itself instead of against
+        # the received word, which is a shortcut that survives without any real
+        # "H x == parity" test.  checks must be built from the *observation* alone.
         if H is not None and observation is not None:
-            obs = self.obs_proj(torch.einsum("mn,bnd->bmd", H, observation))  # B x 16 x c
+            obs_raw = torch.einsum("mn,bnd->bmd", H, observation)      # B x 16 x code_dim
+            obs = self.obs_proj(obs_raw)                                # B x 16 x c
+            # Per-check observation energy, measured on the raw aggregation *before* the
+            # projection.  Erasure sets a token to exactly zero, so this is a direct,
+            # linear read-out of "how much of what this check watches is gone":
+            # measured corr(energy, true per-check density) = 1.000 on random erasure, and
+            # it survives the projection and the LayerNorm below, which together reduce the
+            # corruption's footprint on ``checks`` to ~13% and drown the signal.
+            obs_energy = obs_raw.pow(2).mean(dim=-1)                    # B x 16
+            obs_energy = obs_energy / obs_energy.mean(dim=-1, keepdim=True).clamp(min=1e-6)
         else:
             obs = torch.zeros(b, self.num_parity, self.check_dim,
                               device=variables.device, dtype=node_feat.dtype)
+            obs_energy = torch.zeros(b, self.num_parity, device=variables.device,
+                                     dtype=node_feat.dtype)
         sem = self._check_slots(a_vv @ node_feat, b)                          # B x 16 x c
-        checks = self.check_norm(obs + sem + self.parity_to_check(parity))    # B x 16 x 128
+        sem = sem * torch.sigmoid(self.sem_gate).to(sem.dtype)
+        checks = self.check_norm(obs + sem)                                  # B x 16 x 128
+
+        # ---- 4. the residual the syndrome actually reads ------------------------------
+        # ``check_norm`` is a LayerNorm, so ``checks`` always has per-element scale 1 and
+        # the *absolute* deviation of the observation is normalised away: the corruption
+        # moves ``agg`` by only ~13% relative, which is what made the syndrome head
+        # converge to a constant no matter how it was parameterised.  The residual below
+        # is computed **before** the norm, against the expectation the trusted identity
+        # predicts for exactly this neighbourhood, and handed to the syndrome alongside.
+        # This is the "H x should equal the codeword" test in its literal form.
+        residual = obs                                                  # B x 16 x c
+        if expected_obs is not None and expected_obs.shape == residual.shape:
+            residual = residual - expected_obs
 
         return {
             "A_uv": a_vv,                     # B x 128 x 128 (auxiliary semantic graph)
@@ -143,6 +190,8 @@ class AdaptiveTannerGraph(nn.Module):
             "node_index": node_index,        # B x 128
             "identity_map": identity_map,    # B x 128, in (0,1)
             "checks": checks,                # B x 16 x 128
+            "check_residual": residual,      # B x 16 x 128, pre-normalisation
+            "obs_energy": obs_energy,        # B x 16, per-check observation energy
         }
 
     def _check_slots(self, agg: torch.Tensor, batch: int) -> torch.Tensor:

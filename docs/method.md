@@ -54,8 +54,9 @@ Each parity token connects to only a few identity tokens, forming a learnable Ta
 ## 6. Visual syndrome
 
 ```text
-s_j = D( phi({v_i : i in N(j)}), p_j )
-S   = [s_1 ... s_M]        # Visual Syndrome Map
+checks_j = LN( (H x)_j + g * sem_j )          # observation side: H, no parity
+s_j      = D( phi(checks_j), parity_ref(p_j) ) # compared against the trusted reference
+S        = [s_1 ... s_M]                       # Visual Syndrome Map
 ```
 
 - **Detection**: `S -> P(corruption)`.
@@ -63,13 +64,60 @@ S   = [s_1 ... s_M]        # Visual Syndrome Map
   `{2,7,9}` fire and all connect `v_R^17`, that token is the prime suspect. This is the capability
   plain uncertainty fusion cannot provide.
 
-## 7. Neural belief-propagation decoding
+### 6.1 The syndrome is trained on a *density*, not on a bit
+
+The supervision target for check `j` is the **fraction of its neighbourhood that is corrupted**
+
+```text
+q_j = sum_i 1[H_ji > 0] * M_i  /  sum_i 1[H_ji > 0]
+```
+
+not the binary `1[ (H M)_j > 0 ]`. The binary version is degenerate at this scale. Requiring
+`min_column_degree >= 2` over `N = 256` variables forces at least `2 * 256 / 16 = 32` edges per
+check, so a check that watches 32 tokens sees a 20%-corrupted frame with probability
+`1 - 0.8^32 ~ 0.999`, and the BCE degenerates into "predict 1 everywhere" -- it carries no
+gradient signal about *where* the damage is. The density stays informative at any corruption
+ratio and lets training keep the hard 20% setting rather than lowering it to make the syndrome
+learnable. `1[(H M) > 0]` is kept only as a coarse evaluation label.
+
+### 6.2 The reference must not appear on both sides
+
+Two shortcuts would make the syndrome uninformative without any real coding happening, and both
+are closed structurally:
+
+| Shortcut | Why it is a shortcut | What the code does |
+|---|---|---|
+| `checks = LN( H x + sem + parity_to_check(p) )` while the syndrome compares `checks` against `parity_ref(p)` | the discrepancy is computed against a tensor that already contains `p`; the network can match the two trivially instead of testing whether `H x` really agrees with `p` | the parity projection is **removed** from the check construction. `checks` is built from the observation only; `p` appears exclusively on the reference side. |
+| `w[i,m] = softmax(cos(x_i, U_m) / tau)` computed from the corrupted search tokens | the mixture coefficients of the "redundancy" are decided by the very word the redundancy is supposed to repair | `w` is gated by the per-token reliability: a token the model already distrusts is shrunk towards its neighbourhood mean before the cosine, so it cannot steer `p`. |
+
+The assignment temperature is `tau = tau_min + (tau_max - tau_min) * sigmoid(rho)`, learnable
+yet bounded in `[0.02, 0.5]`. A raw `abs().clamp(min=1e-2)` parameter can sit at 0 (every
+variable collapses onto one identity codeword) or explode (every variable assigned equally, so
+`p` stops being a weighted recombination of the codebook); both extremes silently destroy the
+coding meaning of the parity without changing any shape.
+
+## 7. Neural Tanner decoding (BP-style)
 
 ```text
 Variable -> Check:  m_{i->j}^{(l)} = f_v( v_i^{(l)}, r_i, m_{k->i}^{(l-1)} )
 Check -> Variable:  m_{j->i}^{(l)} = f_c( s_j, p_j, {m_{k->j}} )
 Update:             v_i^{(l+1)} = v_i^{(l)} + (1 - r_i) * dv_i^{(l)}
 ```
+
+### 7.1 What this decoder is, and is not
+
+The messages are aggregated **per node over the whole `H`**: every variable produces one
+message, `H` pools it into 16 checks, and `H^T` broadcasts the result back. Genuine BP's
+`m_{i->j}` / `m_{j->i}` are *edge-specific extrinsic* messages that exclude the message just
+received on that same edge; this implementation has no such exclusion.
+
+So the claim is **neural Tanner decoding / syndrome-guided neural error correction**, and the
+paper should say *BP-style*, not *exact BP*. What the implementation does own is that a single
+`H` drives check aggregation, the supervision label, the `H^T` localization vote and the
+decoder's message passing -- so the four mechanisms cannot drift apart. `tools/diagnostics.py`
+is what has to convince a reviewer: `shuffle-incidence`, `shuffle-parity`,
+`shuffle-syndrome` and `no-decoder` must each visibly degrade `recovery_gain` and
+localization. A probe that does not hurt anything is decoration.
 
 Two to three iterations suffice. The `(1 - r_i)` gate means reliable RGB can repair TIR and reliable
 TIR can repair RGB, while template/history parity stops both from drifting together.
@@ -107,9 +155,30 @@ Four terms, with the reference weights ``lambda_d = 1.0``, ``lambda_c = 2.0``,
 | Term | Supervision | Why it is needed |
 |---|---|---|
 | `L_track` | focal (centre heatmap) + L1 + GIoU on the predicted box | keeps the tracker itself learning while the correction machinery is trained |
-| `L_detect` | BCE on reliability vs. the known token-corruption mask; BCE on the syndrome vs. per-check corruption; BCE on the locator vs. the per-token mask | without it the syndrome can collapse to a constant, and "detection" carries no information. **The model must find the corruption, not merely survive it.** |
-| `L_correct` | `L1(corrected_tokens, clean_teacher_tokens)` for both modalities, weight **2.0** | this is the core claim: the BP decoder must actually restore the corrupted feature. It is supervised directly against the clean tokens rather than only through the tracking loss. |
+| `L_detect` | BCE on reliability vs. the known token-corruption mask; **soft-BCE on the syndrome vs. the per-check corruption density**; BCE on the locator vs. the per-token mask | without it the syndrome can collapse to a constant, and "detection" carries no information. **The model must find the corruption, not merely survive it.** The density target (see 6.1) is what keeps the term from degenerating. |
+| `L_correct` | three sub-terms, weight **2.0** in total | this is the core claim: the decoder must actually restore the corrupted feature. It is supervised directly against the clean tokens rather than only through the tracking loss. |
 | `L_identity` | distillation over the identity codebook: the soft assignment of a repaired token over `U` must match that of its clean counterpart, weight 0.1 | stops the decoder from "repairing" a token onto a **look-alike distractor** (another person, a similar vehicle) instead of the tracked target |
+
+### The three sub-terms of `L_correct`
+
+An absolute distance to the clean teacher is minimised by *any* small output delta, including a
+delta that helps not at all. Two failure modes have to be closed explicitly:
+
+```text
+L_correct  = mean_{i in corrupted}  || x~_i - x*_i ||_1                  # repair the broken ones
+L_preserve = mean_{i in healthy  }  || x~_i - x*_i ||_1                  # leave the rest alone
+L_gain     = relu( e_after - beta * e_before ),   beta = 0.9             # beat your own input
+e_before   = mean_{i in corrupted} || x~_i - x*_i ||_1   (the corrupted input)
+e_after    = mean_{i in corrupted} || x~_i^dec - x*_i ||_1 (the decoder's output)
+total      = L_correct + 0.5 * L_preserve + 1.0 * L_gain
+```
+
+- `L_preserve` alone: a decoder that "repairs" by rewriting **every** token scores exactly as
+  well on `L_correct` as one that fixes the damaged ones and leaves the healthy ones intact.
+- `L_gain` alone: with `beta < 1`, returning the corrupted input unchanged is *not* a solution
+  -- it yields `e_after = e_before`, so the margin is `(1 - beta) * e_before > 0`. Note this is
+  feature-space denoising, not "26 M parameters re-simulating an 86 M encoder": the teacher is
+  the *same* frozen backbone's clean tokens, one pass away.
 
 ### The clean teacher
 

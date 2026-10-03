@@ -63,6 +63,12 @@ class Trainer:
             lambda_detect=float(loss_cfg.get("lambda_detect", 1.0)),
             lambda_correct=float(loss_cfg.get("lambda_correct", 2.0)),
             lambda_identity=float(loss_cfg.get("lambda_identity", 0.1)),
+            lambda_preserve=float(loss_cfg.get("lambda_preserve", 0.5)),
+            lambda_gain=float(loss_cfg.get("lambda_gain", 1.0)),
+            gain_beta=float(loss_cfg.get("gain_beta", 0.9)),
+            detect_reliability=float(loss_cfg.get("detect_reliability", 1.0)),
+            detect_syndrome=float(loss_cfg.get("detect_syndrome", 1.0)),
+            detect_localize=float(loss_cfg.get("detect_localize", 1.0)),
             num_parity=self.model.num_parity,
             dim=self.model.dim,
             code_dim=self.model.code_dim,
@@ -246,10 +252,15 @@ class Trainer:
                            if self.device.type == "cuda" else 0)
                     self.logger.info(
                         "[%s] it %d | loss %.4f | track %.4f (cls %.3f l1 %.3f giou %.3f) "
-                        "| detect %.4f | correct %.4f | identity %.4f | %.2fs/it | %.0f MiB",
+                        "| detect %.4f (rel %.3f syn %.3f loc %.3f) "
+                        "| correct %.4f (gain %.4f preserve %.4f) | identity %.4f "
+                        "| %.2fs/it | %.0f MiB",
                         stage, step, losses["loss"].item(), losses["track"].item(),
                         losses["cls"].item(), losses["l1"].item(), losses["giou"].item(),
-                        losses["detect"].item(), losses["correct"].item(),
+                        losses["detect"].item(), losses["detect_reliability"].item(),
+                        losses["detect_syndrome"].item(), losses["detect_localize"].item(),
+                        losses["correct"].item(), losses["gain"].item(),
+                        losses["preserve"].item(),
                         losses["identity"].item(), (time.time() - t_start) / step, mem)
 
                 if max_iters and step >= max_iters:
@@ -334,7 +345,7 @@ class Trainer:
                          "ratio": img_cfg.ratio, "severity": img_cfg.severity,
                          "target": merged.get("target", "both")}
 
-        diag = {"syndrome": [], "syndrome_y": [], "syndrome_clean": [],
+        diag = {"syndrome": [], "syndrome_y": [], "syndrome_density": [], "syndrome_clean": [],
                 "locator": [], "locator_y": [],
                 "e_before": [], "e_after": [], "e_clean": []}
 
@@ -393,8 +404,14 @@ class Trainer:
                              diag: Dict[str, list]) -> None:
         """Accumulate one frame of error-correction diagnostics.
 
-        Detection is scored against the labels implied by the *shared* incidence
-        (``1[(H @ M) > 0]``), so a random syndrome scores AUROC 0.5.
+        Two per-check labels are recorded because they answer different questions:
+
+        * ``syndrome_y``      -- ``1[(H @ M) > 0]``, "does this check watch anything bad".
+          Under 20% erasure with >=32 edges per check this is ~always 1, so it is kept
+          only as a coarse reference.
+        * ``syndrome_density`` -- the fraction of each check's neighbourhood that is
+          corrupted.  This is what training actually regresses, and what a ranking metric
+          must be computed against.
         """
         m_r = out["token_mask_rgb"][0].float()
         m_t = out["token_mask_tir"][0].float()
@@ -402,6 +419,10 @@ class Trainer:
 
         diag["syndrome"].append(out["syndrome"].flatten(1)[0].float().cpu().numpy())
         diag["syndrome_y"].append(((out["H"] @ mask_any) > 0).float().cpu().numpy())
+        support = out["H_support"].float()                                  # M x N
+        degree = support.sum(dim=1).clamp(min=1.0)
+        diag["syndrome_density"].append(
+            ((support @ mask_any) / degree).float().cpu().numpy())
         diag["locator"].append(out["locator_scattered"][0].float().cpu().numpy())
         diag["locator_y"].append(mask_any.cpu().numpy())
 
@@ -472,13 +493,17 @@ class Trainer:
             merged = {k: [x for d in diags for x in d[k]] for k in diags[0]}
             summary.update(summarize_detection(merged["syndrome"], merged["syndrome_y"],
                                                merged["locator"], merged["locator_y"],
-                                               merged.get("syndrome_clean"), topk))
+                                               merged.get("syndrome_clean"),
+                                               merged.get("syndrome_density"), topk=topk))
             summary.update(summarize_recovery(merged["e_before"], merged["e_after"],
                                               merged["e_clean"]))
             self.logger.info(
-                "error-correction | syndrome AUROC %.3f | locator recall@%d %.3f "
-                "(chance %.3f) | recovery %.3f | damage %.4f",
-                summary["syndrome_auroc"], topk, summary[f"locator_recall_at_{topk}"],
-                summary[f"locator_chance_at_{topk}"], summary["recovery_gain"],
-                summary["damage_clean"])
+                "error-correction | syndrome AUROC %.3f | density rho %.3f (mae %.3f) "
+                "| locator P@%d %.3f (chance %.3f) | recovery %.3f | damage %.4f",
+                summary["syndrome_auroc"],
+                summary.get("syndrome_density_spearman", float("nan")),
+                summary.get("syndrome_density_mae", float("nan")),
+                topk, summary[f"locator_precision_at_{topk}"],
+                summary.get("locator_precision_chance", float("nan")),
+                summary["recovery_gain"], summary["damage_clean"])
         return summary

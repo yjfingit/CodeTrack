@@ -77,6 +77,9 @@ class CodeTrack(nn.Module):
             num_heads=int(get("codebook_heads", 8)),
             links_per_row=int(get("parity_links", 4)),
             dropout=float(get("dropout", 0.0)),
+            temperature=float(get("assign_temperature", 0.1)),
+            tau_min=float(get("tau_min", 0.02)),
+            tau_max=float(get("tau_max", 0.5)),
         )
         self.reliability = ReliabilityEstimator(dim=self.dim, num_identity=self.num_identity,
                                                 code_dim=self.code_dim)
@@ -151,13 +154,28 @@ class CodeTrack(nn.Module):
         # the "received word": both modalities projected into the codebook space and
         # averaged, so corruption in either one shows up in the parity observation
         observation = 0.5 * (self.codebook.to_code(x_r) + self.codebook.to_code(x_t))
-        # the "expected codeword": same H, reconstructed from the trusted identity
-        parity = self.codebook.parity_from_incidence(identity, observation, H)
+        # the "expected codeword": same H, reconstructed from the trusted identity.
+        # ``w`` is gated by the per-token reliability so that already-suspect tokens cannot
+        # drag the mixture coefficients around -- otherwise the "redundancy" would be
+        # computed from the very word it is supposed to correct.
+        reliability_code = 0.5 * (rel["r_r"] + rel["r_t"])
+        parity = self.codebook.parity_from_incidence(identity, observation, H,
+                                                     reliability=reliability_code)
 
         # ---- 2. Syndrome Checking ----------------------------------------------
+        # What the *trusted* identity predicts the same aggregation should look like.
+        # ``parity`` already is exactly that (H @ w @ U), so re-projecting it through the
+        # Tanner's own ``obs_proj`` gives an ``expected_obs`` on the same scale as
+        # ``obs_proj(H @ observation)``.  Their difference is the literal
+        # "H x == codeword" residual the syndrome reports -- and it is computed *before*
+        # the check LayerNorm, which is the only place the magnitude survives.
+        expected_obs = self.tanner.obs_proj(parity)
         graph = self.tanner(x_r, identity, parity, priority=sel["priority"],
-                            variables_tir=x_t, H=H, observation=observation)
-        syn = self.syndrome(graph["checks"], parity)
+                            variables_tir=x_t, H=H, observation=observation,
+                            expected_obs=expected_obs)
+        syn = self.syndrome(graph["checks"], parity,
+                            residual=graph["check_residual"],
+                            obs_energy=graph["obs_energy"])
         loc = self.locator(syn["syndrome"], graph["identity_map"],
                            graph["node_index"], self.num_variables, H=H)
 
@@ -184,6 +202,10 @@ class CodeTrack(nn.Module):
             "feature_map": fus["feature_map"],
             "syndrome": syn["syndrome"],
             "syndrome_raw": syn["syndrome_raw"],
+            "check_agg": syn["check_agg"],
+            "check_ref": syn["check_ref"],
+            "check_delta": syn["check_delta"],
+            "check_residual": graph["check_residual"],
             "reliability_rgb": rel["r_r"],
             "reliability_tir": rel["r_t"],
             "locator": loc["locator"],
@@ -192,6 +214,7 @@ class CodeTrack(nn.Module):
             "gate_rgb": gate_rgb,
             "gate_tir": gate_tir,
             "H": H,
+            "H_support": self.decoder.connectivity(),
             "corrected_rgb": dec["corrected_rgb"],
             "corrected_tir": dec["corrected_tir"],
             "residual_rgb": dec["residual_rgb"],
@@ -244,6 +267,35 @@ class CodeTrack(nn.Module):
                 mask_t = torch.clamp(mask_t + m2, max=1.0)
         return x_r, x_t, mask_r, mask_t
 
+    def _apply_tap_corruption(self, feats: Dict[str, torch.Tensor], mask_rgb: torch.Tensor,
+                              mask_tir: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Erase the FPN taps at exactly the corrupted search positions.
+
+        ``feats["inter_r"]`` / ``feats["inter_t"]`` hold ``block2`` / ``block5`` taps of
+        shape ``B x (Lz + Lx) x C``, where ``Lx`` tokens correspond 1:1 to the corrupted
+        search tokens.  Applying the same mask keeps the two paths honest: the FPN cannot
+        carry information the corrupted token no longer has.
+
+        Only the search part is touched; the template tokens are trusted.
+        """
+        lens_z = int(self.backbone.pos_embed_z.shape[1])
+        out = dict(feats)
+        for key, mask in (("inter_r", mask_rgb), ("inter_t", mask_tir)):
+            taps = feats.get(key)
+            if not taps or float(mask.sum()) == 0:
+                continue
+            corrupted = {}
+            for name, feat in taps.items():
+                if float(mask.sum()) == 0:
+                    corrupted[name] = feat
+                    continue
+                # split template / search, erase the search positions the mask points at
+                z_part, x_part = feat[:, :lens_z], feat[:, lens_z:]
+                keep = (1.0 - mask.to(feat.dtype)).unsqueeze(-1)
+                corrupted[name] = torch.cat([z_part, x_part * keep], dim=1)
+            out[key] = corrupted
+        return out
+
     def forward(self, template_rgb: torch.Tensor, search_rgb: torch.Tensor,
                 template_tir: torch.Tensor, search_tir: torch.Tensor,
                 memory: Optional[torch.Tensor] = None,
@@ -262,6 +314,14 @@ class CodeTrack(nn.Module):
         x_r_clean, x_t_clean = feats["x_r"], feats["x_t"]
 
         x_r, x_t, mask_r, mask_t = self._maybe_corrupt(x_r_clean, x_t_clean, corruption)
+
+        # The FPN taps are read from *inside* the backbone, i.e. before token corruption.
+        # Left untouched they hand the tracker a clean shortcut: L_track can open the gate
+        # and ignore the whole correction branch, because the answer is already in block2
+        # and block5.  A soft gate cannot fix this -- it is an optimisation brake, not a
+        # structural one.  So the taps get the *same* mask at the *same* 16x16 positions:
+        # whatever the decoder does not repair is also missing from the FPN path.
+        feats = self._apply_tap_corruption(feats, mask_r, mask_t)
 
         out = self._code_path(z_r, x_r, z_t, x_t, feats, memory=memory)
         out["token_mask_rgb"] = mask_r

@@ -26,13 +26,21 @@ model:
   num_graph_nodes: 128
   graph_top_k: 8
   bp_iterations: 2
-  # "bp" = neural belief propagation; "mlp" = parameter-matched residual denoiser
-  # with no message passing (the ablation that decides whether Tanner earns its keep)
+  # "bp" = neural Tanner / BP-style message passing; "mlp" = parameter-matched residual
+  # denoiser with no message passing (the ablation that decides whether Tanner earns
+  # its keep).  NOTE: the messages are aggregated per node over the whole H, i.e. there
+  # is no per-edge extrinsic exclusion -- the paper must call this BP-*style*.
   decoder_mode: bp
   h_links_per_check: 32
+  # bounded learnable assignment temperature for the parity mixture
+  # tau = tau_min + (tau_max - tau_min) * sigmoid(rho); init reproduces 0.1
+  assign_temperature: 0.1
+  tau_min: 0.02
+  tau_max: 0.5
   fpn_dim: 256
-  # FPN taps come from before token corruption; the gate starts nearly closed.
-  # Set to false for the no-FPN ablation.
+  # FPN taps come from before token corruption, so they are masked with the *same*
+  # corruption mask (see CodeTrack._apply_tap_corruption): a clean bypass would let
+  # L_track ignore the correction branch entirely.
   use_fpn: true
   head_type: CENTER
   head_channel: 256
@@ -86,6 +94,21 @@ loss:
   lambda_detect: 1.0
   lambda_correct: 2.0
   lambda_identity: 0.1
+  # sub-terms of L_correct (already inside lambda_correct's budget, not a 5th loss):
+  #   preserve -- the decoder must leave healthy tokens alone
+  #   gain     -- the result must beat the corrupted input by a margin, so that
+  #               "change nothing" is not a local optimum
+  lambda_preserve: 0.5
+  lambda_gain: 1.0
+  gain_beta: 0.9
+  # sub-weights of L_detect.  Exposed separately because the syndrome term and the
+  # localization term both read the SAME variable S, and the localization BCE against a
+  # ~0.4-positive mask is satisfied by a constant S=0.5 -- measured, that pinned the
+  # syndrome at its soft-BCE floor of ln(2) for thousands of steps.  Setting
+  # detect_localize=0.0 is the ablation that proves it (pearson -0.000 -> 0.567).
+  detect_reliability: 1.0
+  detect_syndrome: 1.0
+  detect_localize: 1.0
   clean_teacher: true
 
 eval:

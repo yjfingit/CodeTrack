@@ -320,9 +320,19 @@ anyway".  Two additions close that gap.
 | metric | definition | chance level |
 |---|---|---|
 | `syndrome_auroc` | corrupted-frame syndrome vs. **clean-frame** syndrome (the clean pass is the negative class -- without it every check fires and the AUROC is undefined) | 0.5 |
-| `locator_recall_at_k` | corrupted tokens present in the top-k of `locator_scattered` | `k * n_pos / N`, reported alongside as `locator_chance_at_k` |
+| `syndrome_density_spearman` / `_mae` | rank correlation and MAE between the syndrome and the per-check corruption **density** -- the quantity actually supervised | 0 |
+| `locator_precision_at_k` | fraction of the k most suspicious tokens that are corrupted, ranked **within each frame** | the corruption ratio, reported as `locator_precision_chance` |
+| `locator_recall_at_k` | corrupted tokens present in the top-k. Reported for continuity, but its **ceiling is `k / n_corrupted`** (~0.098 at k=5, 20% corruption, 256 tokens), so it must be read against that, not against 1.0 | `k / N` |
 | `recovery_gain` | `(E_before - E_after) / E_before`, **on corrupted tokens only** | 0 |
 | `damage_clean` | error on the untouched tokens, i.e. how much the repair disturbs healthy code | 0 |
+
+Two of these had to be fixed because the metric itself was wrong, not the model:
+
+- `chance_level` returned `k * n_pos / N`, which is the expected **hit count**, not the expected
+  recall. At k=5 / 20% corruption / 256 tokens that is 1.77 -- a baseline above 1.0, so a
+  perfect localizer scored *worse* than chance. Correct value: `k / N`.
+- `recall_at_k` ranked the whole corpus' tokens jointly, so the top-k always came from whichever
+  frames were worst. It now ranks within each frame and averages.
 
 **`tools/diagnostics.py`** runs the perturbations that would expose decoration:
 
@@ -355,3 +365,90 @@ dim-64 model, so the whole file finishes in seconds on CPU.
 > the default configuration had been hiding -- `node_to_variable` had `128` hard-coded, the
 > minimum-degree repair indexed the wrong tensor dimension, and the MLP baseline still
 > carried the (now unused) BP message layers.
+
+---
+
+## 12. Shortcut closures (second review round)
+
+Three structures were letting the tracker take an easier path than the one the architecture
+claims. Each is now closed *structurally*, i.e. the shortcut no longer exists in the graph,
+rather than by a weight that merely discourages it.
+
+### 12.1 Syndrome supervision: OR target -> density target
+
+```python
+# before -- degenerates at this scale
+check_target = ((h @ mask_any.t()) > 0).float().t()
+# after
+degree  = H_support.sum(dim=1).clamp(min=1.0)
+density = ((H_support @ mask_any.t()) / degree.unsqueeze(1)).t().clamp(0, 1)
+```
+
+`min_column_degree >= 2` over `N = 256` forces `>= 2*256/16 = 32` edges per check, so under 20%
+erasure `1[(H@M) > 0]` is ~1 with probability 0.999. The BCE had degenerated into "predict 1
+everywhere". The density target uses the **fixed binary support**, never the learnable weights:
+the neighbourhood a check watches is structural and must not be allowed to move to make the
+target easier.
+
+### 12.2 Tanner: the parity reference no longer appears on both sides
+
+```python
+# before -- the syndrome was compared against a tensor that already contained the parity
+checks = self.check_norm(obs + sem + self.parity_to_check(parity))
+# after
+sem = sem * torch.sigmoid(self.sem_gate)
+checks = self.check_norm(obs + sem)
+```
+
+`VisualSyndrome` already computes `D(phi(checks), parity_ref(parity))`. With `parity` also
+summed into `checks`, the learned discrepancy could match the two copies of the same tensor
+instead of testing whether `H x` actually agrees with the code. The `parity_to_check` layer is
+**deleted**, not merely disconnected -- leaving it would be 33 K dead parameters.
+
+Two further guards on the reference itself:
+
+| guard | before | after |
+|---|---|---|
+| assignment temperature `tau` | `abs().clamp(min=1e-2)` on a raw parameter: can reach 0 (all variables collapse onto one identity codeword) or explode (all assigned equally, parity stops being a weighted recombination) | `tau = tau_min + (tau_max - tau_min) * sigmoid(rho)`, learnable, bounded in `[0.02, 0.5]` |
+| who decides the mixture `w[i,m]` | `cos(x_i, U_m)` with `x_i` the **corrupted** search token -- the redundancy was steered by the word it must repair | the token is first shrunk towards its neighbourhood mean by its own reliability: `v <- normalize(r*v + (1-r)*mean(v))`, so a distrusted token cannot move `w` |
+
+### 12.3 FPN: the bypass is masked, not gated
+
+The block-2 / block-5 taps are read from inside the backbone, i.e. **before** token corruption.
+`fpn_gate` (bias -2, sigmoid ~0.12) only slowed the shortcut down; `L_track` could always open
+it, because the clean answer was sitting right there. `CodeTrack._apply_tap_corruption` now
+applies the *same* corruption mask at the *same* 16x16 positions to the search part of every
+tap, before the FPN projection:
+
+```python
+z_part, x_part = feat[:, :lens_z], feat[:, lens_z:]
+x_part = x_part * (1.0 - mask).unsqueeze(-1)
+```
+
+Template tokens are untouched. Whatever the decoder fails to repair is now also missing from
+the FPN path, so the two cannot be compared on unequal information.
+
+### 12.4 `L_correct`: three sub-terms instead of one
+
+| sub-term | closes |
+|---|---|
+| `L_preserve` (0.5) | a decoder that "repairs" by rewriting *every* token scores the same as one that fixes the damaged ones -- the healthy tokens are now pinned too |
+| `L_gain` (1.0, beta = 0.9) | returning the corrupted input unchanged: `e_after = e_before` gives margin `(1-beta) * e_before > 0` |
+| `L_correct` (1.0) | the original absolute repair term |
+
+This also settles the "26 M cannot restore an 86 M encoder" worry. The decoder never
+re-simulates the backbone: the teacher is the **same frozen backbone's** clean tokens, and the
+corruption is applied to feature tokens *after* the backbone. The task is feature-space
+denoising, and `L_gain` is what forces the decoder to actually use the redundancy instead of
+learning the identity.
+
+### 12.5 Naming
+
+The decoder aggregates messages per node over the whole `H`; it has no per-edge extrinsic
+exclusion, so it is not textbook BP. The code, config comments and `docs/method.md` now say
+**neural Tanner decoding / BP-style**. The claim that is actually owned -- and that
+`tools/diagnostics.py` exists to defend -- is that one shared `H` drives check aggregation, the
+supervision label, the `H^T` localization vote and the message passing, so those four cannot
+drift apart. `tests/unit/test_architecture.py` grew from 16 to 26 tests: density target (x2),
+no parity in `checks`, bounded `tau`, reliability-gated `w`, masked FPN taps, `L_gain` biting,
+`L_preserve` applied to the total, `chance_level` as a recall, per-frame recall ranking.

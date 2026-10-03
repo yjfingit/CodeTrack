@@ -26,6 +26,7 @@ Design notes
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -43,7 +44,9 @@ class TargetCodebookEncoder(nn.Module):
 
     def __init__(self, dim: int = 768, code_dim: int = 256, proj_dim: int = 512,
                  num_identity: int = 16, num_parity: int = 16, num_heads: int = 8,
-                 links_per_row: int = 4, dropout: float = 0.0):
+                 links_per_row: int = 4, dropout: float = 0.0,
+                 temperature: float = 0.1, tau_min: float = 0.02,
+                 tau_max: float = 0.5):
         super().__init__()
         self.dim = dim
         self.code_dim = code_dim
@@ -69,7 +72,18 @@ class TargetCodebookEncoder(nn.Module):
         # search tokens -> codebook space, so that variable observations and the parity
         # reference live in the same space
         self.to_code_proj = nn.Linear(dim, code_dim)
-        self.assign_temperature = nn.Parameter(torch.tensor(0.1))
+
+        # Bounded learnable assignment temperature.  Previously this was
+        # ``abs().clamp(min=1e-2)`` on a raw parameter, which can sit at 0 (assignments
+        # collapse onto one identity codeword) or explode (assignments become uniform and
+        # the parity stops being a weighted recombination).  A sigmoid inside [tau_min,
+        # tau_max] rules both out while staying differentiable everywhere.
+        self.tau_min = float(tau_min)
+        self.tau_max = float(tau_max)
+        # init so that sigmoid(logit) reproduces the reference temperature 0.1
+        frac = (temperature - tau_min) / max(tau_max - tau_min, 1e-6)
+        frac = min(max(frac, 1e-3), 1 - 1e-3)
+        self.temperature_logit = nn.Parameter(torch.tensor(math.log(frac / (1 - frac))))
 
         self.norm = nn.LayerNorm(code_dim)
         trunc_normal_(self.identity_queries, std=.02)
@@ -98,8 +112,39 @@ class TargetCodebookEncoder(nn.Module):
         """Project search tokens into the codebook space, ``B x N x 256``."""
         return self.to_code_proj(tokens)
 
+    def temperature(self) -> torch.Tensor:
+        """Bounded learnable ``tau`` in ``[tau_min, tau_max]``.
+
+        ``tau = tau_min + (tau_max - tau_min) * sigmoid(rho)``: it can never reach 0
+        (all variables collapsing onto a single identity codeword) nor blow up (every
+        variable assigned equally, i.e. the parity stops being a weighted recombination of
+        the codebook).  Both extremes silently destroy the coding meaning of the parity.
+        """
+        return self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.temperature_logit)
+
+    def assignment(self, variables: torch.Tensor, identity: torch.Tensor,
+                   reliability: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Soft assignment ``w`` of every variable over the identity codebook.
+
+        ``reliability`` (``B x N``, in ``[0, 1]``) down-weights the *observed* token
+        towards its neighbourhood mean before the cosine is taken.  This is the cheap
+        version of "the assignment must not depend on a corrupted received word": a token
+        the model already distrusts cannot drag the mixture coefficients around, so the
+        parity stays a function of the **trusted template** plus a mild observation cue.
+        A fully template-only assignment would be corruption-proof but would also be
+        frame-independent, which throws away the only adaptivity the check has.
+        """
+        v = F.normalize(variables, dim=-1)
+        if reliability is not None:
+            r = reliability.to(v.dtype).unsqueeze(-1)
+            # keep the (reliable) mean direction of the neighbourhood as a stand-in
+            v = F.normalize(r * v + (1.0 - r) * v.mean(dim=1, keepdim=True), dim=-1)
+        cos = v @ F.normalize(identity, dim=-1).transpose(-2, -1)     # B x N x K
+        return torch.softmax(cos / self.temperature(), dim=-1)
+
     def parity_from_incidence(self, identity: torch.Tensor, variables: torch.Tensor,
-                              H: torch.Tensor) -> torch.Tensor:
+                              H: torch.Tensor,
+                              reliability: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reference codewords for the checks defined by ``H``.
 
         ``w[i, m]`` measures how strongly variable ``i`` is explained by identity token
@@ -117,13 +162,8 @@ class TargetCodebookEncoder(nn.Module):
             identity: ``B x K x d`` template-derived codewords.
             variables: ``B x N x dim`` search tokens (fused over modalities by caller).
             H: ``M x N`` normalised parity-check matrix from the decoder.
+            reliability: optional ``B x N`` reliability used to stabilise ``w``.
         """
-        temp = self.assign_temperature.abs().clamp(min=1e-2)
-        w = torch.softmax(
-            F.normalize(variables, dim=-1) @ F.normalize(identity, dim=-1).transpose(-2, -1)
-            / temp, dim=-1)                                        # B x N x K
+        w = self.assignment(variables, identity, reliability=reliability)
         a_dyn = torch.einsum("mn,bnk->bmk", H, w)                 # B x M x K
         return self.norm(a_dyn @ identity)                         # B x M x d
-
-    def connectivity(self) -> torch.Tensor:
-        return self.parity_generator.connectivity()
