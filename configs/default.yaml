@@ -31,7 +31,23 @@ model:
   # its keep).  NOTE: the messages are aggregated per node over the whole H, i.e. there
   # is no per-edge extrinsic exclusion -- the paper must call this BP-*style*.
   decoder_mode: bp
-  h_links_per_check: 32
+  h_links_per_check: 24
+  # Locality prior on H's support.  0 = uniform random (off).  With a window of W cells on
+  # the 16x16 grid each check may only LEARN edges inside its own window, plus a
+  # free_edge_frac share of unrestricted edges so it can still reach across the frame.
+  # Rationale: with a uniform random support a spatially contiguous burst is still just an
+  # arbitrary fixed-size set to every check, so the burst's spatial continuity is washed out
+  # before it reaches check-space.  The edges stay learned (softplus(H) inside the window);
+  # only the candidate set is restricted, so the claim is "learned sparse H under a
+  # geometric prior", not a hand-designed neighbourhood.
+  # 16 = the measured optimum.  Under burst erasure this lifts the per-check density
+  # contrast (std/mean) from 0.31 to 1.30 -- a 4.3x widening that is a property of the
+  # geometry, not of the head -- and the syndrome's pearson from 0.815 to 0.978.
+  # It buys nothing under independent erasure (contrast stays 0.27-0.32), which is the
+  # point: a Tanner prior can only exploit damage that is spatially coherent.
+  h_locality_window: 16
+  h_free_edge_frac: 0.25
+  h_locality_wrap: true
   # bounded learnable assignment temperature for the parity mixture
   # tau = tau_min + (tau_max - tau_min) * sigmoid(rho); init reproduces 0.1
   assign_temperature: 0.1
@@ -103,7 +119,11 @@ loss:
   #   gain     -- the result must beat the corrupted input by a margin, so that
   #               "change nothing" is not a local optimum
   lambda_preserve: 0.5
-  lambda_gain: 1.0
+  # L_gain is off: its hinge measured gain_active_fraction = 0.00 and e_ratio_p95 = 0.000,
+  # i.e. genuinely inactive, and the ablation is within noise (pearson 0.978 on vs 0.968
+  # off, softbce 0.5112 vs 0.5174). To demand a larger recovery margin, lower gain_beta
+  # rather than raising the weight -- see docs/architecture.md section 13.
+  lambda_gain: 0.0
   gain_beta: 0.9
   # sub-weights of L_detect.  Exposed separately because the syndrome term and the
   # localization term both read the SAME variable S, and the localization BCE against a

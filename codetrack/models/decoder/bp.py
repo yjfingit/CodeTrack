@@ -30,6 +30,8 @@ class NeuralBPDecoder(nn.Module):
                  num_variables: int = 256, iterations: int = 2,
                  links_per_check: int = 32, min_column_degree: int = 2,
                  mode: str = "bp", mlp_hidden: int = 0,
+                 locality_window: int = 0, free_edge_frac: float = 0.25,
+                 locality_wrap: bool = True,
                  generator: Optional[torch.Generator] = None):
         super().__init__()
         self.dim = dim
@@ -38,11 +40,56 @@ class NeuralBPDecoder(nn.Module):
         self.num_variables = num_variables
         self.mode = mode
 
-        # ---- parity-check matrix H (16 x 256) with a fixed sparse support ----------
+        # ---- parity-check matrix H (M x N) with a fixed sparse support -------------
         support = torch.zeros(num_parity, num_variables)
-        for row in range(num_parity):
-            picked = torch.randperm(num_variables, generator=generator)[:links_per_check]
-            support[row, picked] = 1.0
+        # Locality prior.  With a uniformly random support, a spatially contiguous burst is
+        # still just "an arbitrary fixed-size set" to every check, so the burst's spatial
+        # continuity is washed out on the way into check-space -- measured, the per-check
+        # density spread under burst (0.049) was no larger than under independent erasure
+        # (0.058).  The Tanner graph was therefore sensing combinatorial adjacency, not visual
+        # space.  Measured with the bypass off, burst is in fact the ONE corruption where the
+        # syndrome is informative (pearson 0.793 vs 0.007), so some of that alignment does
+        # matter; this makes it a *prior* rather than a hard constraint.
+        #
+        # Each check draws its edges from a local candidate window (row * cand -> next
+        # cand * grid cells on the 2-D search grid) and still LEARNS which k of those to
+        # keep via softplus(H).  A small share of edges stays unrestricted so the model can
+        # reach across the frame when locality is the wrong bias.  The claim stays "learned
+        # sparse H under a geometric prior", not "hand-designed neighbourhood".
+        grid = int(round(num_variables ** 0.5))
+        spatial = (grid * grid == num_variables) and (grid >= 2)
+        if spatial and locality_window > 0:
+            cand = min(int(locality_window), num_variables)
+            # window start depends on the check, so different checks watch different places
+            span = max(num_variables - cand, 1)
+            cand_idx = torch.arange(num_variables).view(1, -1)      # 1 x N
+            offset = (torch.rand(num_parity, generator=generator) * span).long().view(-1, 1)
+            dist = (cand_idx - offset).abs()                        # M x N
+            # circular distance on the grid, so the window wraps instead of biasing the
+            # right/bottom edge
+            if locality_wrap:
+                dist = torch.minimum(dist, num_variables - dist)
+            allowed = dist < cand
+            for row in range(num_parity):
+                pool = torch.nonzero(allowed[row], as_tuple=False).flatten()
+                if pool.numel() == 0:
+                    pool = torch.randperm(num_variables, generator=generator)
+                picked = pool[torch.randperm(pool.numel(), generator=generator)
+                              [:min(links_per_check, pool.numel())]]
+                support[row, picked] = 1.0
+            # the unrestricted share: a few random edges per check, so a check can still
+            # reach outside its window when the geometry is misleading
+            n_free = max(1, int(round(free_edge_frac * links_per_check)))
+            for row in range(num_parity):
+                free = torch.nonzero(support[row] == 0).flatten()
+                if free.numel() == 0:
+                    continue
+                picked = free[torch.randperm(free.numel(), generator=generator)[:n_free]]
+                support[row, picked] = 1.0
+        else:
+            for row in range(num_parity):
+                picked = torch.randperm(num_variables, generator=generator)[:links_per_check]
+                support[row, picked] = 1.0
 
         # Guarantee a minimum column degree.  A variable watched by no check can never
         # receive a correction message, so its "repair" could only come from the local

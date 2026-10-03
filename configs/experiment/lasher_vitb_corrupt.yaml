@@ -11,7 +11,13 @@ corruption:
   # and the FPN path becomes a shortcut that bypasses the whole correction branch
   rgb: [rgb_lowlight, rgb_occl]
   tir: [tir_crossover, tir_noise]
-  token: [tok_random_erase]
+  # Burst erasure is the corruption the Tanner prior can actually use: it is spatially
+  # coherent, so a locality-aligned H turns it into a check-level pattern (per-check
+  # density contrast 0.31 -> 1.30, syndrome pearson 0.007 -> 0.978).  Under independent
+  # random erasure the same prior buys nothing (contrast stays ~0.29) and the syndrome
+  # carries no information at all.  Both settings are reported in the paper; random
+  # erasure is the negative control that shows the prior is doing the work.
+  token: [tok_burst_erase]
   ratio: 0.2
   severity: 0.4
   target: both

@@ -452,3 +452,103 @@ supervision label, the `H^T` localization vote and the message passing, so those
 drift apart. `tests/unit/test_architecture.py` grew from 16 to 26 tests: density target (x2),
 no parity in `checks`, bounded `tau`, reliability-gated `w`, masked FPN taps, `L_gain` biting,
 `L_preserve` applied to the total, `chance_level` as a recall, per-frame recall ranking.
+
+---
+
+## 13. The observation-energy leak, and what else it invalidated
+
+Section 12.1 replaced the binary syndrome target with a per-check corruption density. That
+target turned out to be **derivable from a single scalar feature**, which made a whole class
+of results meaningless.
+
+### 13.1 What the leak was
+
+Random erasure sets a corrupted token to exactly zero. So for any check `j`,
+
+```
+mean_{i in N(j)} || x_i ||^2   collapses in proportion to how many of its tokens were erased
+```
+
+and the collapse factor *is* the density label. Measured, `corr(obs_energy_j, q_j) = 1.0000`.
+
+`TannerGraph` exposed this as `obs_energy` and `VisualSyndrome` added it to `s_raw`. A head
+reading it never has to learn any check/variable consistency -- it just reads the label off a
+local energy reading. Stop-gradient would not have fixed this: that blocks the gradient, not
+the numerical leak.
+
+`model.syndrome_use_obs_energy` now defaults to **false**. The decoder may still use an
+observation-quality cue; the syndrome head does not.
+
+### 13.2 What it invalidated (all numbers, 1500 steps, bypass on/off)
+
+| corruption | obs_energy | pearson | softbce | constant | beats |
+|---|---|---|---|---|---|
+| random erase | off | 0.0069 | 0.6535 | 0.6529 | no |
+| random erase | **on** | **0.3935** | 0.6525 | 0.6529 | yes |
+| feat noise | off | 0.0000 | 0.6532 | 0.6525 | no |
+| feat noise | on | 0.0052 | 0.6532 | 0.6525 | no |
+| **burst erase** | **off** | **0.7930** | **0.6402** | 0.6472 | **yes** |
+| burst erase | on | 0.8143 | 0.6427 | 0.6472 | yes |
+
+Two conclusions, one of them inconvenient:
+
+1. **Every earlier random-erase number was the bypass.** 0.394 -> 0.007 once removed. The
+   Tanner structure contributed nothing under independent erasure.
+2. **Burst erasure is the setting where the syndrome is genuinely informative without the
+   leak**, and its density spread is the widest of the three (std 0.094 vs 0.071 / 0.072).
+
+`feat_noise` fails either way, as predicted: additive noise does not collapse the
+neighbourhood energy, so there is no local energy signature, and the corruption is not
+spatially structured either.
+
+### 13.3 The degree sweep was confounded too
+
+With `M = 16` fixed and the bypass **off**, `h_links_per_check` = 8 / 12 / 16 / 32 give
+pearson 0.025 / 0.011 / 0.015 / 0.008 -- none beats the constant.
+
+The earlier "degree 8 gives pearson 0.792" was measured with the bypass **on**, i.e. two
+variables moved at once. Raising `M` from 16 to 32 at the same time (which also raises the
+total edge count, the average token's check-degree and the support overlap) made things
+worse, 0.792 -> 0.142, and the confound is why: `M` alone does not widen a single check's
+density distribution.
+
+Lesson recorded in `tools/sweep_degree.sh`: fix `M`, sweep one axis, and re-measure with the
+bypass off. The lesson I did not apply the first time is that any new axis needs the leak
+re-checked before its numbers mean anything.
+
+### 13.4 One definition of the recovery numbers
+
+`CodeTrackLoss.masked_recovery()` is now the only place `e_before` / `e_after` / the
+`L_gain` hinge are computed. Training calls it, and `Trainer._collect_diagnostics` calls
+the same function, so the training log and the evaluation cannot drift apart again.
+
+The evaluation reports a distribution, not a rounded mean:
+
+| metric | why |
+|---|---|
+| `hinge_mean`, `hinge_p95` | a hinge at 0.0000 on average may be active on half the frames |
+| `gain_active_fraction` | the direct answer to "is the constraint still binding?" |
+| `e_after_over_before` | the recovery ratio; < 1 means the decoder helps |
+| `e_ratio_p95` | the worst-case frame, which the mean hides |
+
+First reading on the new logging: `gain_active_fraction = 0.00`, `e_ratio_p95 = 0.000`. The
+hinge really is inactive, not merely rounded -- but the weights are left alone until the
+definitions have been compared on the same batch, since a hinge that has been satisfied
+once may still have pushed the solution into the feasible set.
+
+### 13.5 Locality prior on H (`h_locality_window`, default off)
+
+A uniformly random support means a spatially contiguous burst is still just an arbitrary
+fixed-size set to every check, so its spatial continuity is washed out before it reaches
+check-space -- which is why burst's density spread (0.049) was originally no better than
+independent erasure's (0.058). But burst is exactly where the syndrome works, so some
+alignment already matters.
+
+Each check now draws its edges from a **local candidate window** on the search grid (with a
+circular distance so the window wraps instead of biasing the frame edge) and still *learns*
+which `k` of those to keep through `softplus(H)`; `h_free_edge_frac` of its edges stay
+unrestricted so a check can still reach across the frame when locality is the wrong bias.
+
+The claim stays **"learned sparse H under a geometric prior"**. It is deliberately not a
+hand-designed convolution neighbourhood: the edges are still learned, only the candidate set
+is restricted.

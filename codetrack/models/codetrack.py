@@ -109,7 +109,10 @@ class CodeTrack(nn.Module):
                                        num_variables=self.num_variables,
                                        iterations=int(get("bp_iterations", 2)),
                                        links_per_check=int(get("h_links_per_check", 32)),
-                                       mode=str(get("decoder_mode", "bp")))
+                                       mode=str(get("decoder_mode", "bp")),
+                                       locality_window=int(get("h_locality_window", 0)),
+                                       free_edge_frac=float(get("h_free_edge_frac", 0.25)),
+                                       locality_wrap=bool(get("h_locality_wrap", True)))
         self.fusion = CodeTrackFusion(dim=self.dim, fpn_dim=int(get("fpn_dim", 256)),
                                       head_dim=self.dim, grid=self.grid,
                                       taps=self.return_stages,

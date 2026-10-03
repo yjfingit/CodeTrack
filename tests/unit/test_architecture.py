@@ -17,6 +17,8 @@ import torch
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# tools/ holds locality_geometry, whose spatial_alignment is the measurement used below
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 
 from codetrack.models.codetrack import CodeTrack  # noqa: E402
 
@@ -581,3 +583,87 @@ def test_syndrome_raw_carries_an_explicit_discrepancy_scale():
     # d_scale is learnable and starts at 1, so raw ~= RMS(delta) + d(delta); the ratio must
     # stay finite and positive rather than collapsing to 0
     assert torch.isfinite(ratio).all() and float(ratio.min()) > 1e-3
+
+
+# ------------------------------------------------- locality prior on H's support
+def test_locality_window_widens_the_per_check_density_contrast():
+    """The whole point of the prior, measured on H alone -- no network involved.
+
+    A spatially coherent burst is invisible to a uniformly random H: every check sees an
+    arbitrary fixed-size set, so the per-check densities all land near the corruption ratio
+    (measured std/mean = 0.31).  Aligning H with the search grid widens that spread 4x, which
+    is what gives the syndrome head something to rank.  Under *independent* erasure the
+    prior must change nothing -- there is no spatial structure to align with.
+    """
+    from codetrack.models.decoder.bp import NeuralBPDecoder
+
+    n, m, grid = 256, 16, 16
+    burst = torch.zeros(n, dtype=torch.bool)
+    burst[:40] = True                                  # 40 contiguous cells
+    rand = torch.zeros(n, dtype=torch.bool)
+    rand[torch.randperm(n)[:51]] = True                 # 20% scattered
+
+    def contrast(window: int, mask: torch.Tensor, seed: int = 0) -> float:
+        torch.manual_seed(seed)
+        dec = NeuralBPDecoder(dim=8, num_variables=n, num_parity=m, links_per_check=24,
+                              min_column_degree=2, locality_window=window)
+        sup = dec.connectivity()
+        deg = sup.sum(dim=1).clamp(min=1.0)
+        q = (sup @ mask.float()) / deg
+        return float(q.std() / q.mean())
+
+    off = contrast(0, burst)
+    on = contrast(16, burst)
+    assert on > 2.5 * off, f"locality prior did not widen the contrast: {off:.3f} -> {on:.3f}"
+
+    # and it must be a no-op for spatially incoherent damage
+    assert abs(contrast(0, rand, 1) - contrast(16, rand, 1)) < 0.15
+
+
+def test_locality_prior_keeps_the_support_sparse_and_the_column_degree_valid():
+    """The window restricts the candidate set, not the learning: every check still picks its
+    own edges, keeps `min_column_degree`, and the support stays a fixed binary mask."""
+    model = CodeTrack(tiny_cfg(h_locality_window=8, h_links_per_check=4,
+                               h_free_edge_frac=0.25))
+    sup = model.decoder.connectivity()
+    assert set(sup.unique().tolist()) <= {0.0, 1.0}, "support must stay binary"
+    assert float(sup.sum(dim=1).min()) > 0, "every check must watch something"
+    assert int(sup.sum(dim=0).min()) >= 2, "min_column_degree must still hold"
+    # a window of 8 cells cannot host 4+ edges from anywhere but locally
+    assert float(sup.sum()) < model.num_parity * model.num_variables
+
+
+def test_locality_window_zero_is_the_original_uniform_support():
+    """``h_locality_window: 0`` must reproduce the pre-prior behaviour exactly, so the
+    ablation in the paper is a flag rather than a different model."""
+    from codetrack.models.decoder.bp import NeuralBPDecoder
+
+    torch.manual_seed(0)
+    a = CodeTrack(tiny_cfg(h_locality_window=0)).decoder.connectivity()
+    torch.manual_seed(0)
+    b = CodeTrack(tiny_cfg(h_locality_window=0)).decoder.connectivity()
+    assert torch.equal(a, b)
+    # and with a window the watched cells really are spatially tighter.  Compactness is the
+    # mean pairwise distance between a check's cells, normalised by a uniform draw of the
+    # same size: < 1 means more local than chance.  (Counting how many *pairs of checks* share
+    # a variable is not a valid proxy here -- window overlap makes that non-monotonic, it
+    # went 858 -> 672 -> 1016 across windows 0/8/16.)
+    from tools.locality_geometry import spatial_alignment
+
+    torch.manual_seed(0)
+    uniform = NeuralBPDecoder(dim=8, num_variables=256, num_parity=16,
+                              links_per_check=24, min_column_degree=2,
+                              locality_window=0).connectivity()
+    torch.manual_seed(0)
+    windowed = NeuralBPDecoder(dim=8, num_variables=256, num_parity=16,
+                               links_per_check=24, min_column_degree=2,
+                               locality_window=16).connectivity()
+    assert spatial_alignment(windowed, 16) < 0.95 * spatial_alignment(uniform, 16)
+
+
+def test_obs_energy_bypass_is_off_by_default():
+    """Under zero-erasure the observation energy *is* the density label (corr 1.000), so the
+    syndrome head must not see it unless explicitly asked.  Any result claiming the Tanner
+    structure produced the syndrome depends on this default."""
+    assert CodeTrack(tiny_cfg()).syndrome.use_obs_energy is False
+    assert CodeTrack(tiny_cfg(syndrome_use_obs_energy=True)).syndrome.use_obs_energy is True
