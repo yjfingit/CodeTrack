@@ -65,10 +65,31 @@ CodeTrack/
 
 ---
 
+## GitHub sync
+
+Upstream repository: <https://github.com/yjfingit/CodeTrack>
+
+Everything merged into `main` is pushed to `origin` automatically. A `post-commit`
+hook pushes `HEAD` in the background (never blocks a commit, never opens a
+credential prompt) and appends its output to `.git/push.log`.
+
+```bash
+bash tools/install-git-hooks.sh                # once per clone / container reset
+bash tools/sync-to-github.sh "feat: something" # manual fallback: stage, commit, push
+```
+
+What gets pushed is exactly what `.gitignore` allows: source, configs, docs, tests.
+Datasets, weights and run outputs are excluded by design.
+
+Credentials are stored on the machine, never in the repository — see
+[docs/reproducibility.md](docs/reproducibility.md#git-credentials).
+
+---
+
 ## Installation
 
 ```bash
-git clone <repo-url> CodeTrack
+git clone https://github.com/yjfingit/CodeTrack.git
 cd CodeTrack
 
 # python >= 3.10

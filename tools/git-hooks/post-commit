@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# Auto-push every commit to origin.
+# Installed by tools/install-git-hooks.sh — do not edit the copy in .git/hooks/.
+#
+# Design notes:
+#   - Runs in the background, so an unreachable GitHub never blocks a commit.
+#   - GIT_TERMINAL_PROMPT=0 guarantees it can never hang waiting for a password.
+#   - Output goes to .git/push.log for later inspection.
+
+LOG="$(git rev-parse --git-dir)/push.log"
+SHA="$(git rev-parse --short HEAD)"
+
+(
+  {
+    echo "----- $(date '+%F %T')  push ${SHA} -----"
+    GIT_TERMINAL_PROMPT=0 git push origin HEAD 2>&1
+    echo "exit=$?"
+  } >>"${LOG}" 2>&1
+) &
+
+exit 0

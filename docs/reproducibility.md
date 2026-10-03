@@ -39,6 +39,26 @@ bash scripts/eval.sh   configs/experiment/<exp>.yaml outputs/<exp>/best.pth
 
 Record in the results table: config path, commit hash, seed, GPU, and log path.
 
+## Git credentials
+
+Credentials are **never** stored in the repository. On a headless GPU box the standard setup is a
+stored HTTPS credential:
+
+```bash
+git config --global credential.helper store
+# writes ~/.git-credentials (chmod 600), one line:
+#   https://<user>:<token>@github.com
+```
+
+The token is a GitHub personal access token with `Contents: Read and write` on this repository.
+
+Operational rules:
+
+1. Never commit `.git-credentials`, `.env`, or any file containing a token.
+2. `.git/push.log` records every automatic push attempt — check it when a commit silently fails to
+   appear on GitHub.
+3. Rotate (revoke + reissue) the token if it is ever pasted into a chat, log or ticket.
+
 ## Known sources of variance
 
 - Non-deterministic CUDA kernels in attention and `scatter` ops.
