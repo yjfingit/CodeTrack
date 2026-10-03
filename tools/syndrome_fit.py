@@ -46,12 +46,24 @@ def main() -> int:
     ap.add_argument("--ratio", type=float, default=0.2)
     ap.add_argument("--severity", type=float, default=0.4)
     ap.add_argument("--out", default="outputs/syndrome_fit.json")
+    ap.add_argument("--override", action="append", default=[],
+                    help="config override key.sub=value, must match the checkpoint's shape")
     args = ap.parse_args()
 
-    cfg = load_config(args.config, [])
+    # The checkpoint fixes the architecture (M, N, degree); the default config would build
+    # a differently-shaped model and load_state_dict would fail with an opaque message.
+    cfg = load_config(args.config, args.override)
     trainer = Trainer(cfg, output_dir=Path(args.out).parent / "synfit")
-    trainer.model.load_state_dict(torch.load(args.checkpoint, map_location="cpu")["model"],
-                                 strict=False)
+    state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["model"]
+    missing, unexpected = trainer.model.load_state_dict(state, strict=False)
+    hard = [k for k in missing if "temperature_logit" not in k]
+    if hard:
+        raise SystemExit(
+            f"checkpoint does not fit this architecture: {len(hard)} missing tensors, "
+            f"e.g. {hard[:3]}.\nThe checkpoint was trained with different model settings "
+            f"(num_parity_tokens / h_links_per_check / ...); pass the same values:\n"
+            f"  --override model.num_parity_tokens=32"
+        )
     model = trainer.model.to(trainer.device).eval()
 
     b, n = 16, model.num_variables
