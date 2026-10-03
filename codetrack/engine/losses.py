@@ -174,9 +174,18 @@ class CodeTrackLoss(nn.Module):
         density = (hit / degree.unsqueeze(1)).t().clamp(0.0, 1.0)      # B x M
 
         syndrome = outputs["syndrome"].float().flatten(1).clamp(1e-4, 1 - 1e-4)
-        # soft target -> soft-BCE (a.k.a. cross-entropy against a fractional label)
-        syndrome_loss = -(density * torch.log(syndrome)
-                          + (1.0 - density) * torch.log(1.0 - syndrome)).mean()
+        if "syndrome_logits" in outputs:
+            # The head already emits logits; re-applying sigmoid->clamp->log by hand throws
+            # away the log-sum-exp stabilisation and re-introduces the clamp gradient
+            # flattening.  BCEWithLogitsLoss accepts a continuous [0,1] target directly, which
+            # is exactly what the density is.
+            # logits come as B x 1 x M (the syndrome map shape the figure annotates);
+            # the density target is B x M
+            syndrome_loss = F.binary_cross_entropy_with_logits(
+                outputs["syndrome_logits"].float().flatten(1), density)
+        else:
+            syndrome_loss = -(density * torch.log(syndrome)
+                              + (1.0 - density) * torch.log(1.0 - syndrome)).mean()
 
         locator = outputs["locator_scattered"].float().clamp(1e-4, 1 - 1e-4)
         localize = F.binary_cross_entropy(locator, mask_any)

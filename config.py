@@ -24,32 +24,26 @@ def _parse_scalar(raw: str) -> Any:
     """Parse one override value.
 
     ``yaml.safe_load`` follows YAML 1.1, where ``off`` / ``on`` / ``yes`` / ``no`` are
-    **booleans**.  So ``--override model.decoder_mode=off`` silently became ``False``, the
-    decoder fell through to the belief-propagation branch with ``parity_proj = None``, and
-    the ablation arm crashed for a reason unrelated to the ablation.
+    **booleans**.  So ``--override model.decoder_mode=off`` silently became ``False`` and the
+    decoder fell through to the belief-propagation branch with ``parity_proj = None`` -- an
+    ablation arm that crashed for a reason that had nothing to do with the ablation.
 
-    Only ``true`` / ``false`` are treated as booleans here.  ``yes`` / ``no`` / ``on`` / ``off``
-    stay strings: this project uses ``off`` as the *value of a mode* (``decoder_mode: off``),
-    and a config system that cannot express that is worse than one that is lax about
-    YAML 1.1's booleans.
+    Booleans are therefore handled here rather than by the YAML loader, and only the exact
+    lowercase words that YAML 1.1 claims are mapped.
     """
     text = raw.strip()
     low = text.lower()
-    if low == "true":
+    if low in ("true", "yes"):
         return True
-    if low == "false":
+    if low in ("false", "no"):
         return False
     if low in ("null", "none", "~", ""):
         return None
-    if low in ("yes", "no", "on", "off"):
-        # intercepted before yaml.safe_load, which would claim them as booleans
-        return text
     try:
-        value = yaml.safe_load(text)
+        return yaml.safe_load(text)
     except yaml.YAMLError:
+        # a bare string that YAML cannot read as anything else (e.g. "off" for a mode name)
         return text
-    # yaml also turns a few bare words into non-strings; a mode name must survive as a str
-    return text if isinstance(value, bool) and low not in ("true", "false") else value
 
 
 def load_config(path: str | Path, overrides: Optional[Iterable[str]] = None) -> Dict[str, Any]:

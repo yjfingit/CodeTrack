@@ -31,7 +31,7 @@ class NeuralBPDecoder(nn.Module):
                  links_per_check: int = 32, min_column_degree: int = 2,
                  mode: str = "bp", mlp_hidden: int = 0,
                  locality_window: int = 0, free_edge_frac: float = 0.25,
-                 locality_wrap: bool = True,
+                 locality_wrap: bool = True, weight_init: str = "learned",
                  generator: Optional[torch.Generator] = None):
         super().__init__()
         self.dim = dim
@@ -40,49 +40,56 @@ class NeuralBPDecoder(nn.Module):
         self.num_variables = num_variables
         self.mode = mode
 
-        # ---- parity-check matrix H (M x N) with a fixed sparse support -------------
-        support = torch.zeros(num_parity, num_variables)
-        # Locality prior.  With a uniformly random support, a spatially contiguous burst is
-        # still just "an arbitrary fixed-size set" to every check, so the burst's spatial
-        # continuity is washed out on the way into check-space -- measured, the per-check
-        # density spread under burst (0.049) was no larger than under independent erasure
-        # (0.058).  The Tanner graph was therefore sensing combinatorial adjacency, not visual
-        # space.  Measured with the bypass off, burst is in fact the ONE corruption where the
-        # syndrome is informative (pearson 0.793 vs 0.007), so some of that alignment does
-        # matter; this makes it a *prior* rather than a hard constraint.
+        # ---- parity-check matrix H (M x N): a FIXED sparse support, LEARNED weights ----
         #
-        # Each check draws its edges from a local candidate window (row * cand -> next
-        # cand * grid cells on the 2-D search grid) and still LEARNS which k of those to
-        # keep via softplus(H).  A small share of edges stays unrestricted so the model can
-        # reach across the frame when locality is the wrong bias.  The claim stays "learned
-        # sparse H under a geometric prior", not "hand-designed neighbourhood".
+        # Naming matters here and was wrong before.  ``H_support`` is registered as a buffer
+        # and never updated: ``softplus(H) * H_support`` cannot create an edge, and nothing
+        # runs a top-k selection during training.  The honest description is therefore
+        # **"learned edge weights on a geometrically-constructed fixed sparse support"**,
+        # not "learned connectivity".
+        #
+        # Locality prior.  With a uniformly random support a spatially contiguous burst is just
+        # "an arbitrary fixed-size set" to every check, so its spatial continuity is washed out
+        # before it reaches check-space.  Measured, the per-check density spread under burst
+        # (0.049) was no better than under independent erasure (0.058): the graph was sensing
+        # combinatorial adjacency, not visual space.  Each check therefore draws its edges from
+        # a local candidate window on the search grid and keeps ``links_per_check`` of them.
+        support = torch.zeros(num_parity, num_variables)
         grid = int(round(num_variables ** 0.5))
         spatial = (grid * grid == num_variables) and (grid >= 2)
         if spatial and locality_window > 0:
-            cand = min(int(locality_window), num_variables)
-            # window start depends on the check, so different checks watch different places
-            span = max(num_variables - cand, 1)
-            cand_idx = torch.arange(num_variables).view(1, -1)      # 1 x N
-            offset = (torch.rand(num_parity, generator=generator) * span).long().view(-1, 1)
-            dist = (cand_idx - offset).abs()                        # M x N
-            # circular distance on the grid, so the window wraps instead of biasing the
-            # right/bottom edge
-            if locality_wrap:
-                dist = torch.minimum(dist, num_variables - dist)
-            allowed = dist < cand
+            # 2-D grid distance.  The previous code used ``|index - offset|`` on the *flattened*
+            # index, which is not a spatial distance at all: a window of 16 there is up to 31
+            # consecutive indices, i.e. it straddles row ends, and "wrap" by
+            # ``num_variables - dist`` is meaningless on a flattened layout.
+            yy, xx = torch.meshgrid(torch.arange(grid), torch.arange(grid), indexing="ij")
+            coords = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=1).float()   # N x 2
+            half = max(1, int(locality_window) // 2)
+
             for row in range(num_parity):
-                pool = torch.nonzero(allowed[row], as_tuple=False).flatten()
-                if pool.numel() == 0:
-                    pool = torch.randperm(num_variables, generator=generator)
+                # a different centre per check, so the checks do not all watch one place
+                cy = int(torch.randint(0, grid, (1,), generator=generator))
+                cx = int(torch.randint(0, grid, (1,), generator=generator))
+                dy = (coords[:, 0] - cy).abs()
+                dx = (coords[:, 1] - cx).abs()
+                if locality_wrap:
+                    dy = torch.minimum(dy, grid - dy)
+                    dx = torch.minimum(dx, grid - dx)
+                inside = torch.nonzero((dy <= half) & (dx <= half), as_tuple=False).flatten()
+                pool = inside if inside.numel() >= links_per_check else torch.arange(
+                    num_variables)
                 picked = pool[torch.randperm(pool.numel(), generator=generator)
-                              [:min(links_per_check, pool.numel())]]
+                              [:links_per_check]]
                 support[row, picked] = 1.0
-            # the unrestricted share: a few random edges per check, so a check can still
-            # reach outside its window when the geometry is misleading
-            n_free = max(1, int(round(free_edge_frac * links_per_check)))
+
+            # The unrestricted share, added *after* the local edges so the degree stays
+            # predictable: ``links_per_check`` local + ``n_free`` global.  Previously the free
+            # edges were drawn from whatever the window left over, so the final degree varied
+            # with the window and ``h_links_per_check`` never meant anything.
+            n_free = int(round(free_edge_frac * links_per_check))
             for row in range(num_parity):
                 free = torch.nonzero(support[row] == 0).flatten()
-                if free.numel() == 0:
+                if free.numel() == 0 or n_free == 0:
                     continue
                 picked = free[torch.randperm(free.numel(), generator=generator)[:n_free]]
                 support[row, picked] = 1.0
@@ -91,11 +98,13 @@ class NeuralBPDecoder(nn.Module):
                 picked = torch.randperm(num_variables, generator=generator)[:links_per_check]
                 support[row, picked] = 1.0
 
-        # Guarantee a minimum column degree.  A variable watched by no check can never
-        # receive a correction message, so its "repair" could only come from the local
-        # update MLP -- which would silently turn the BP path into decoration.
-        # Attach to *free* rows, and loop, so the guarantee holds even when the random
-        # pattern is sparse relative to num_parity * min_column_degree.
+        # Minimum column degree.  A variable watched by no check can never receive a
+        # correction message, so its "repair" could only come from the local update MLP --
+        # which would silently turn the BP path into decoration.  Note this can push the mean
+        # row degree above ``links_per_check``: with N=256, M=16 and min_column_degree=2 the
+        # support carries at least 2*256/16 = 32 edges per check.  ``h_links_per_check`` is
+        # therefore the *pre-repair* degree, and the realised degree is reported by
+        # ``tools/locality_geometry.py``.
         col_degree = support.sum(dim=0)
         for col in torch.nonzero(col_degree < min_column_degree, as_tuple=False).flatten():
             while float(support[:, col].sum()) < min_column_degree:
@@ -106,7 +115,13 @@ class NeuralBPDecoder(nn.Module):
                 support[int(free[pick]), col] = 1.0
 
         self.register_buffer("H_support", support)
-        self.H = nn.Parameter(support.clone() / links_per_check)
+        # ``weight_init="uniform"`` freezes the edge weights at 1/degree, i.e. plain
+        # averaging over the neighbourhood.  It exists so the paper can separate the two
+        # contributions the review asked about: a *fixed local support with uniform weights*
+        # is pure geometry, the same support with learned weights adds learning on top.
+        self.learn_weights = str(weight_init) != "uniform"
+        self.H = nn.Parameter(support.clone() / links_per_check,
+                              requires_grad=self.learn_weights)
 
         # ---- message functions ---------------------------------------------------
         # In "mlp" mode none of these exist, otherwise they would be dead parameters and
@@ -124,7 +139,9 @@ class NeuralBPDecoder(nn.Module):
             )
         else:
             self.v_msg = self.parity_proj = self.c_msg = self.update = None
-        self.out_norm = nn.LayerNorm(dim)
+        # mode "off" has no message functions and no output norm: it is a pass-through, and
+        # leaving a learnable LayerNorm in place would let "no decoder" still rescale tokens.
+        self.out_norm = nn.LayerNorm(dim) if mode != "off" else None
 
         # ---- parameter-matched baseline -------------------------------------
         # "mlp" removes message passing entirely and replaces each BP round with a
@@ -145,7 +162,8 @@ class NeuralBPDecoder(nn.Module):
     def _h(self) -> torch.Tensor:
         # non-negative, row-normalised weights: softplus keeps A_ij in R+ as documented,
         # whereas a raw Parameter can drift negative and explode when its row sum -> 0
-        h = F.softplus(self.H) * self.H_support
+        h = (F.softplus(self.H) if self.learn_weights
+             else torch.full_like(self.H, 1.0)) * self.H_support
         return h / h.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
     def connectivity(self) -> torch.Tensor:
@@ -177,6 +195,17 @@ class NeuralBPDecoder(nn.Module):
         each ``B x 256 x 768`` -- matching "Corrected zg / Corrected xg / Residual" in
         the architecture figure.
         """
+        # "off" = the correction branch is removed from the graph entirely.  Zeroing the
+        # *loss weights* is not the same thing: the decoder would still run and still rewrite
+        # the tokens, so a "no decoder" arm trained that way measures a normally-trained
+        # decoder that is merely unpenalised.  tools/diagnostics.py uses the same definition,
+        # so training and inference mean the same thing by "no decoder".
+        if self.mode == "off":
+            zeros = torch.zeros_like(variables_rgb)
+            return {"corrected_rgb": variables_rgb, "corrected_tir": variables_tir,
+                    "residual_rgb": zeros, "residual_tir": zeros,
+                    "norm_only_rgb": variables_rgb, "norm_only_tir": variables_tir}
+
         b = variables_rgb.shape[0]
         v = torch.cat([variables_rgb, variables_tir], dim=0)       # 2B x 256 x 768
         r = torch.cat([reliability_rgb, reliability_tir], dim=0).unsqueeze(-1)

@@ -104,15 +104,20 @@ def shuffled_syndrome(model, seed: int = 0) -> Iterator[None]:
 
 @contextmanager
 def no_decoder(model) -> Iterator[None]:
-    """Bypass the belief-propagation decoder entirely (identity correction)."""
+    """Bypass the decoder entirely, exactly as ``decoder_mode="off"`` does in training.
+
+    The patched signature returns the same keys the real decoder returns, including
+    ``norm_only_*`` -- otherwise the loss helper takes a different branch here than it does
+    during training and the two "no decoder" conditions are not comparable.
+    """
     dec = model.decoder
     original = dec.forward
 
     def patched(variables_rgb, variables_tir, *args, **kwargs):
-        b = variables_rgb.shape[0]
         zeros = torch.zeros_like(variables_rgb)
         return {"corrected_rgb": variables_rgb, "corrected_tir": variables_tir,
-                "residual_rgb": zeros, "residual_tir": zeros}
+                "residual_rgb": zeros, "residual_tir": zeros,
+                "norm_only_rgb": variables_rgb, "norm_only_tir": variables_tir}
 
     dec.forward = patched
     try:

@@ -106,7 +106,9 @@ class VisualSyndrome(nn.Module):
 
         # SP (syndrome processing) x2, then ``S``
         self.sp1 = nn.Sequential(nn.Linear(num_parity, hidden), nn.GELU())
-        self.sp2 = nn.Sequential(nn.Linear(hidden, num_parity), nn.Sigmoid())
+        # Linear only: the Sigmoid is applied explicitly in forward so the logit stays
+        # available for BCEWithLogitsLoss while downstream consumers keep the [0,1] density.
+        self.sp2 = nn.Linear(hidden, num_parity)
 
         # Start at the density the supervision actually expects.  With a 0 bias the head
         # outputs 0.5 everywhere, soft-BCE sits at ln(2) = 0.693, and the observed symptom
@@ -114,10 +116,8 @@ class VisualSyndrome(nn.Module):
         # sigmoid's gradient vanishes long before the target's logit.
         prior = min(max(float(density_prior), 1e-3), 1 - 1e-3)
         with torch.no_grad():
-            # sp2 is Sequential(Linear, Sigmoid): the bias to preset is sp2[-2]'s
-            bias = self.sp2[-2].bias if isinstance(self.sp2[-2], nn.Linear) else None
-            if bias is not None:
-                bias.fill_(float(torch.logit(torch.tensor(prior))))
+            with torch.no_grad():
+                self.sp2.bias.fill_(float(torch.logit(torch.tensor(prior))))
 
     def forward(self, checks: torch.Tensor, parity: torch.Tensor,
                 residual: Optional[torch.Tensor] = None,
@@ -153,9 +153,13 @@ class VisualSyndrome(nn.Module):
         s_raw = s * self.d_scale                                  # B x 16
 
         y = self.sp1(s_raw)
-        syndrome = self.sp2(y)                                   # B x 1 x 16
+        # keep the logit so the loss can use BCEWithLogitsLoss, and the sigmoid output for
+        # everything downstream (locator, gating, evaluation) so no consumer sees a new range
+        logits = self.sp2(y)                                      # B x 16
+        syndrome = torch.sigmoid(logits)                          # B x 1 x 16
 
         return {"syndrome": syndrome.unsqueeze(1), "syndrome_raw": s_raw,
+                "syndrome_logits": logits.unsqueeze(1),
                 "check_agg": agg, "check_ref": ref, "check_delta": delta,
                 "check_residual": residual}
 

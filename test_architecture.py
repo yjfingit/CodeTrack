@@ -693,14 +693,10 @@ def test_config_override_does_not_turn_off_into_false():
     cfg = load_config("configs/default.yaml", ["model.decoder_mode=off"])
     assert cfg["model"]["decoder_mode"] == "off"
 
-    # only true/false are booleans here; "yes"/"no"/"on"/"off" stay strings so that
-    # decoder_mode=off and discrepancy=off are expressible at all
-    for raw, want in (("true", True), ("false", False)):
+    # and the genuinely boolean values still work
+    for raw, want in (("true", True), ("false", False), ("yes", True), ("no", False)):
         c = load_config("configs/default.yaml", [f"model.freeze_backbone={raw}"])
         assert c["model"]["freeze_backbone"] is want, raw
-    for raw in ("yes", "no", "on", "off"):
-        c = load_config("configs/default.yaml", [f"model.discrepancy={raw}"])
-        assert c["model"]["discrepancy"] == raw, raw
 
     # numbers and lists survive
     c = load_config("configs/default.yaml", ["model.h_links_per_check=24",

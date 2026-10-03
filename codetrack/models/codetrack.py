@@ -112,7 +112,8 @@ class CodeTrack(nn.Module):
                                        mode=str(get("decoder_mode", "bp")),
                                        locality_window=int(get("h_locality_window", 0)),
                                        free_edge_frac=float(get("h_free_edge_frac", 0.25)),
-                                       locality_wrap=bool(get("h_locality_wrap", True)))
+                                       locality_wrap=bool(get("h_locality_wrap", True)),
+                                       weight_init=str(get("h_weight_init", "learned")))
         self.fusion = CodeTrackFusion(dim=self.dim, fpn_dim=int(get("fpn_dim", 256)),
                                       head_dim=self.dim, grid=self.grid,
                                       taps=self.return_stages,
@@ -211,6 +212,7 @@ class CodeTrack(nn.Module):
             "feature_map": fus["feature_map"],
             "syndrome": syn["syndrome"],
             "syndrome_raw": syn["syndrome_raw"],
+            "syndrome_logits": syn["syndrome_logits"],
             "check_agg": syn["check_agg"],
             "check_ref": syn["check_ref"],
             "check_delta": syn["check_delta"],

@@ -40,13 +40,19 @@ model:
   # before it reaches check-space.  The edges stay learned (softplus(H) inside the window);
   # only the candidate set is restricted, so the claim is "learned sparse H under a
   # geometric prior", not a hand-designed neighbourhood.
-  # 16 = the measured optimum.  Under burst erasure this lifts the per-check density
-  # contrast (std/mean) from 0.31 to 1.30 -- a 4.3x widening that is a property of the
-  # geometry, not of the head -- and the syndrome's pearson from 0.815 to 0.978.
-  # It buys nothing under independent erasure (contrast stays 0.27-0.32), which is the
-  # point: a Tanner prior can only exploit damage that is spatially coherent.
-  h_locality_window: 16
+  # 5 => a 5x5 cell window (the code uses this as the half-width, so the window is
+  # 2*(5//2)+1 = 5 cells per side).  Measured on 2-D block corruption, the per-check density
+  # contrast (std/mean) over the window half-widths {1,2,3,4,6,8} is
+  # {0.41, 1.10, 0.94, 0.73, 0.49, 0.41} against 0.43 with no prior at all: half-width 2 is
+  # the peak, a 2.6x widening that is a property of the geometry and not of any head.
+  # It buys nothing under independent erasure, which is the point -- a Tanner prior can only
+  # exploit damage that is spatially coherent.
+  h_locality_window: 5
   h_free_edge_frac: 0.25
+  # "learned" = softplus(H) weights on the fixed support; "uniform" freezes them at plain
+  # 1/degree averaging.  The pair isolates geometry from learning: uniform+local is pure
+  # geometry, learned+local adds the learned weights on top.
+  h_weight_init: learned
   h_locality_wrap: true
   # bounded learnable assignment temperature for the parity mixture
   # tau = tau_min + (tau_max - tau_min) * sigmoid(rho); init reproduces 0.1
