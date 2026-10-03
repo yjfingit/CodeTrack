@@ -206,8 +206,14 @@ class SharedViTBackbone(nn.Module):
 
     # ------------------------------------------------------------------ freeze
     def freeze_backbone(self) -> None:
-        """Freeze every pretrained parameter (backbone blocks, patch embeddings, positions)."""
-        for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks, self.norm):
+        """Freeze every parameter of the backbone, including the FPN tap LayerNorms.
+
+        The figure marks the transformer as *Frozen*; the tap norms were CodeTrack
+        additions, but leaving 0.003 M trainable inside a "frozen" backbone is exactly
+        the kind of detail a reviewer pokes at, so they are frozen too.
+        """
+        for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks,
+                       self.norm, self.inter_norms):
             for p in module.parameters():
                 p.requires_grad = False
         for p in (self.pos_embed, self.pos_embed_z, self.pos_embed_x):
@@ -215,7 +221,8 @@ class SharedViTBackbone(nn.Module):
         self.frozen = True
 
     def unfreeze_backbone(self) -> None:
-        for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks, self.norm):
+        for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks,
+                       self.norm, self.inter_norms):
             for p in module.parameters():
                 p.requires_grad = True
         for p in (self.pos_embed, self.pos_embed_z, self.pos_embed_x):

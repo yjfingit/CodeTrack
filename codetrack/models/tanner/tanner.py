@@ -72,17 +72,22 @@ class AdaptiveTannerGraph(nn.Module):
 
         # 16 check slots pool the graph-node features (soft, learnable topology)
         self.slot_weight = nn.Parameter(torch.rand(num_parity, self.num_graph_nodes))
+        # parity observation (code space) -> check space
+        self.obs_proj = nn.Linear(code_dim, check_dim)
 
     def forward(self, variables: torch.Tensor, identity: torch.Tensor,
                 parity: torch.Tensor, priority: Optional[torch.Tensor] = None,
                 variables_tir: Optional[torch.Tensor] = None,
-                H: Optional[torch.Tensor] = None
+                H: Optional[torch.Tensor] = None,
+                observation: Optional[torch.Tensor] = None
                 ) -> Dict[str, torch.Tensor]:
         """``variables``: ``B x 256 x 768``; ``identity``/``parity``: ``B x 16 x 256``.
 
-        ``H`` is the **shared parity-check matrix** ``M x N`` owned by the decoder.  When
-        given, the 16 check nodes are obtained by aggregating *all* variables through it,
-        which is what makes this a Tanner graph rather than three unrelated structures.
+        ``H`` is the **shared parity-check matrix** ``M x N`` owned by the decoder, and
+        ``observation`` is the code-space view of the variables (``B x N x code_dim``).
+        Together they decide the check nodes: the check is what ``H`` says the codeword
+        should look like over its neighbourhood, and the syndrome is how far the actual
+        observation is from it.
 
         ``priority`` (``B x 256``, from the target candidate selector) is added to the
         internal identity score when choosing which nodes become graph nodes.
@@ -120,16 +125,16 @@ class AdaptiveTannerGraph(nn.Module):
         a_vv = sparsified_softmax(logits, self.top_k)                   # B x 128 x 128
 
         # ---- 3. check nodes -------------------------------------------------------
-        # Aggregate the FULL variable set through the shared H, so that the syndrome is
-        # a genuine parity check over the same incidence the decoder uses.
-        if H is not None:
-            all_feat = self.node_embed(variables)                      # B x 256 x check_dim
-            if variables_tir is not None:
-                all_feat = 0.5 * (all_feat + self.node_embed(variables_tir))
-            check_slots = torch.einsum("mn,bnd->bmd", H, all_feat)     # B x 16 x check_dim
-        else:                                                          # legacy fallback
-            check_slots = self._check_slots(a_vv @ node_feat, b)
-        checks = self.check_norm(check_slots + self.parity_to_check(parity))   # B x 16 x 128
+        # Primary term: the parity observation aggregated through the SHARED H, i.e. what
+        # the code says the checks should see.  The A_vv term adds semantic context only;
+        # it is an auxiliary variable-variable graph, not a second check matrix.
+        if H is not None and observation is not None:
+            obs = self.obs_proj(torch.einsum("mn,bnd->bmd", H, observation))  # B x 16 x c
+        else:
+            obs = torch.zeros(b, self.num_parity, self.check_dim,
+                              device=variables.device, dtype=node_feat.dtype)
+        sem = self._check_slots(a_vv @ node_feat, b)                          # B x 16 x c
+        checks = self.check_norm(obs + sem + self.parity_to_check(parity))    # B x 16 x 128
 
         return {
             "A_uv": a_vv,                     # B x 128 x 128 (auxiliary semantic graph)

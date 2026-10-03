@@ -138,14 +138,24 @@ class CodeTrack(nn.Module):
                    x_t: torch.Tensor, feats: Dict[str, torch.Tensor],
                    memory: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Everything after the backbone: coding -> checking -> correction -> head."""
-        identity, parity, _query = self.codebook(z_r, z_t, memory)
+        # ---- 1. Target Coding -------------------------------------------------
+        # identity comes from the trusted template only
+        identity, _query = self.codebook.encode_identity(z_r, z_t, memory)
         rel = self.reliability(x_r, x_t, identity, memory)
         sel = self.selector(x_r, x_t, identity)
 
         # one incidence H for check aggregation, syndrome, localization and BP
         H = self.decoder.matrix()
+
+        # the "received word": both modalities projected into the codebook space and
+        # averaged, so corruption in either one shows up in the parity observation
+        observation = 0.5 * (self.codebook.to_code(x_r) + self.codebook.to_code(x_t))
+        # the "expected codeword": same H, reconstructed from the trusted identity
+        parity = self.codebook.parity_from_incidence(identity, observation, H)
+
+        # ---- 2. Syndrome Checking ----------------------------------------------
         graph = self.tanner(x_r, identity, parity, priority=sel["priority"],
-                            variables_tir=x_t, H=H)
+                            variables_tir=x_t, H=H, observation=observation)
         syn = self.syndrome(graph["checks"], parity)
         loc = self.locator(syn["syndrome"], graph["identity_map"],
                            graph["node_index"], self.num_variables, H=H)

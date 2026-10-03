@@ -277,3 +277,35 @@ one" experiment.
 * The warm-up stage unfreezes the whole detect+repair chain, not just codebook+decoder --
   otherwise the syndrome and locator stayed random while the loss asked them to localize.
 * `timm` is declared in `requirements.txt` / `pyproject.toml`.
+
+### 11.7 The parity tokens now belong to `H`
+
+The deepest residue of the "three unrelated structures" problem was still present after the
+first revision: the parity tokens were `P = A·U` with a `16x16` matrix built from the
+template, while the check neighbourhoods were defined by a completely unrelated
+`H (16x256)`.  The syndrome was therefore comparing a search observation against an
+*arbitrary* reference rather than against what that particular check should have seen.
+
+The parity is now **induced by the same incidence**:
+
+```text
+w[i, m] = softmax_m ( cos(x_i, U_m) / tau )        # how strongly variable i is
+                                                    # explained by codeword m
+A_dyn   = H @ w                                      # M x K, the induced parity matrix
+parity_j = sum_m A_dyn[j, m] * U_m                  # what check j expects
+obs      = H @ x                                     # what check j actually sees
+s_j      = D(phi(obs)_j, parity_j)
+```
+
+`parity_j` is now, by construction, the value check `j` expects over exactly the
+neighbourhood it watches, reconstructed from the **trusted template** rather than from the
+possibly corrupted search frame.  The static `16x16` generator (`SparseParityGenerator`)
+was removed rather than left as dead code.
+
+`obs` is computed on the **modality-averaged** code-space projection,
+`0.5 * (to_code(x_r) + to_code(x_t))`, so damage in either modality enters the syndrome
+directly instead of only through the graph construction.
+
+The auxiliary `A_vv` semantic graph is retained but is no longer a parallel "check": it
+contributes an additive context term to the check representation, and the primary term is
+`obs_proj(H @ observation)`.

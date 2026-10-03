@@ -38,45 +38,6 @@ except ImportError:  # pragma: no cover
     from timm.models.layers import trunc_normal_
 
 
-class SparseParityGenerator(nn.Module):
-    """``P = A @ U`` with a learnable, structurally sparse ``A``.
-
-    The *support* of ``A`` is a fixed random pattern (``links_per_row`` ones per row,
-    ``A_ij in {0, 1}``); only the weights on that support are trained, giving a soft
-    sparse ``A_ij in [0, 1]``.  Sparsity is what makes error *localization* possible
-    later: a small number of failing checks pinpoints the corrupt token.
-    """
-
-    def __init__(self, num_identity: int = 16, num_parity: int = 16,
-                 links_per_row: int = 4, generator: Optional[torch.Generator] = None):
-        super().__init__()
-        self.num_identity = num_identity
-        self.num_parity = num_parity
-        self.links_per_row = min(max(links_per_row, 1), num_identity)
-
-        pattern = torch.zeros(num_parity, num_identity)
-        for row in range(num_parity):
-            idx = torch.randperm(num_identity, generator=generator)[:self.links_per_row]
-            pattern[row, idx] = 1.0
-        self.register_buffer("support", pattern, persistent=True)
-
-        weight = pattern.clone()
-        weight = weight / weight.sum(dim=1, keepdim=True).clamp(min=1.0)
-        self.A = nn.Parameter(weight)
-
-    def forward(self, identity: torch.Tensor) -> torch.Tensor:
-        """``identity``: ``B x K x d`` -> ``B x M x d``."""
-        # non-negative weights (as documented: A_ij in [0, 1]) -- a raw Parameter
-        # divided by its row sum can go negative and blow up when the sum hits zero
-        a = F.softplus(self.A) * self.support
-        a = a / a.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        return a @ identity
-
-    def connectivity(self) -> torch.Tensor:
-        """Binary support of ``A`` -- the incidence structure of the Tanner graph."""
-        return (self.support > 0).float()
-
-
 class TargetCodebookEncoder(nn.Module):
     """Produce the target error-correcting codebook ``C_t = {U_t, P_t}``."""
 
@@ -104,19 +65,19 @@ class TargetCodebookEncoder(nn.Module):
 
         # ECC projection: Linear 768 -> 256
         self.ecc_identity = nn.Linear(dim, code_dim)
-        self.parity_generator = SparseParityGenerator(
-            num_identity=num_identity, num_parity=num_parity, links_per_row=links_per_row)
+
+        # search tokens -> codebook space, so that variable observations and the parity
+        # reference live in the same space
+        self.to_code_proj = nn.Linear(dim, code_dim)
+        self.assign_temperature = nn.Parameter(torch.tensor(0.1))
 
         self.norm = nn.LayerNorm(code_dim)
         trunc_normal_(self.identity_queries, std=.02)
 
-    def forward(self, z_r: torch.Tensor, z_t: torch.Tensor,
-                memory: Optional[torch.Tensor] = None
-                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(identity U, parity P, query)``.
-
-        ``U``: ``B x 16 x 256``, ``P``: ``B x 16 x 256``, ``query``: ``B x 144 x 768``.
-        """
+    def encode_identity(self, z_r: torch.Tensor, z_t: torch.Tensor,
+                        memory: Optional[torch.Tensor] = None
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Template -> identity codewords ``U`` (``B x 16 x 256``) and the query tensor."""
         b = z_r.shape[0]
         tokens = [z_r, z_t]
         if memory is not None and memory.numel() > 0:
@@ -129,9 +90,40 @@ class TargetCodebookEncoder(nn.Module):
         q = self.proj(q)                                 # B x 144 x 768  (Query)
         q = self.codebook_block(q)                       # B x 144 x 768
 
+        # the 16 learnable queries sit AFTER the 128 template tokens
         identity = self.ecc_identity(q[:, -self.num_identity:])   # B x 16 x 256
-        parity = self.parity_generator(identity)                 # B x 16 x 256
-        return identity, self.norm(parity), q
+        return identity, q
+
+    def to_code(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Project search tokens into the codebook space, ``B x N x 256``."""
+        return self.to_code_proj(tokens)
+
+    def parity_from_incidence(self, identity: torch.Tensor, variables: torch.Tensor,
+                              H: torch.Tensor) -> torch.Tensor:
+        """Reference codewords for the checks defined by ``H``.
+
+        ``w[i, m]`` measures how strongly variable ``i`` is explained by identity token
+        ``m`` (soft assignment in ``[0, 1]`` with rows summing to 1).  The induced parity
+        matrix is ``A = H @ w`` -- shape ``M x K`` -- and
+
+            parity_j = sum_m A[j, m] U_m
+
+        is therefore the value check ``j`` *expects* over exactly the neighbourhood it
+        watches.  This is what binds the codebook to the Tanner incidence: without it the
+        parity tokens and ``H`` are two unrelated structures and the syndrome compares a
+        search observation against an arbitrary reference.
+
+        Args:
+            identity: ``B x K x d`` template-derived codewords.
+            variables: ``B x N x dim`` search tokens (fused over modalities by caller).
+            H: ``M x N`` normalised parity-check matrix from the decoder.
+        """
+        temp = self.assign_temperature.abs().clamp(min=1e-2)
+        w = torch.softmax(
+            F.normalize(variables, dim=-1) @ F.normalize(identity, dim=-1).transpose(-2, -1)
+            / temp, dim=-1)                                        # B x N x K
+        a_dyn = torch.einsum("mn,bnk->bmk", H, w)                 # B x M x K
+        return self.norm(a_dyn @ identity)                         # B x M x d
 
     def connectivity(self) -> torch.Tensor:
         return self.parity_generator.connectivity()
