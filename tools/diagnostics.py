@@ -5,8 +5,8 @@ Tracking metrics cannot tell you whether the Tanner machinery is doing anything.
 three probes can, and they are cheap -- no retraining, just perturbed inference:
 
 1. **Shuffle test** -- permute the columns of ``H``, the parity order, or the syndrome at
-   inference time.  A model that genuinely uses the code should degrade; one that has
-   learned to ignore it will not move at all.
+   inference time.  Degradation supports dependence on the perturbed path; a null result
+   needs follow-up because a single shuffle may not isolate every learned dependency.
 2. **FPN causal 2x2** -- clean/corrupted decoder tokens x clean/corrupted FPN, via the
    ``use_fpn`` flag and the corruption switch.
 3. **Degree split** -- recovery gain reported separately for variables that no check
@@ -29,11 +29,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from codetrack.utils.runtime import CPU_THREAD_SETTINGS  # noqa: E402,F401
+
+import torch
+
 from codetrack.engine.trainer import Trainer  # noqa: E402
+from codetrack.utils.checkpoint import load_checkpoint  # noqa: E402
 from codetrack.utils.config import load_config  # noqa: E402
 
 
@@ -138,7 +141,7 @@ PROBES = {
 # ----------------------------------------------------------------------- main
 def run_probe(trainer: Trainer, checkpoint: Optional[str], probe: str,
               corruption: Dict[str, Any], max_sequences: int, max_frames: int,
-              topk: int) -> Dict[str, float]:
+              topk: int) -> Dict[str, Any]:
     """Evaluate one probe.
 
     The checkpoint is loaded for **every** probe, not just the baseline.  It used to be
@@ -147,30 +150,36 @@ def run_probe(trainer: Trainer, checkpoint: Optional[str], probe: str,
     A shuffle probe that shows "no change" under those conditions means nothing at all --
     which is exactly how a broken ablation can look like a clean negative result.
     """
+    if not checkpoint:
+        raise ValueError("--checkpoint is required so probes measure a trained model")
+    report = load_checkpoint(checkpoint, trainer.model, map_location=str(trainer.device))
+    trainer.logger.info("loaded checkpoint %s (epoch %s)", checkpoint, report["epoch"])
+
+    # Apply the intervention only after loading.  evaluate(checkpoint=...) reloads model
+    # weights at entry, which used to silently overwrite the shuffled incidence/parity.
     context = PROBES[probe]
     if context is None:
-        return trainer.evaluate(checkpoint=checkpoint, max_sequences=max_sequences,
-                                max_frames=max_frames, corruption=corruption, topk=topk)
+        return trainer.evaluate(max_sequences=max_sequences, max_frames=max_frames,
+                                corruption=corruption, topk=topk)
     with context(trainer.model):
-        return trainer.evaluate(checkpoint=checkpoint, max_sequences=max_sequences,
-                                max_frames=max_frames, corruption=corruption, topk=topk)
+        return trainer.evaluate(max_sequences=max_sequences, max_frames=max_frames,
+                                corruption=corruption, topk=topk)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/experiment/lasher_vitb.yaml")
-    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out", default="outputs/diagnostics")
     parser.add_argument("--sequences", type=int, default=5)
     parser.add_argument("--frames", type=int, default=30)
     parser.add_argument("--ratio", type=float, default=0.2)
     parser.add_argument("--severity", type=float, default=0.4)
     parser.add_argument("--target", default="both", choices=["both", "rgb", "tir"])
-    parser.add_argument("--token", default="tok_burst_erase",
-                        help="token corruption to probe with; MUST match what the checkpoint "
-                             "was trained on. Random erasure is the negative control (the "
-                             "syndrome carries no information there), burst is the setting "
-                             "the locality prior is built for.")
+    parser.add_argument("--token", default="tok_block_erase",
+                        help="token corruption to probe with; record whether it matches the "
+                             "checkpoint's training corruption. Random erasure is a control "
+                             "for the spatial-locality hypothesis.")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--probe", default="all",
                         help="comma separated probes, or 'all'")
@@ -184,26 +193,49 @@ def main() -> int:
     corruption = {
         "enabled": True,
         "token": [args.token],
+        "rgb": [],
+        "tir": [],
+        "cross_modal": False,
         "ratio": args.ratio,
         "severity": args.severity,
         "target": args.target,
     }
 
     probes = list(PROBES) if args.probe == "all" else args.probe.split(",")
-    results: Dict[str, Dict[str, float]] = {}
+    results: Dict[str, Dict[str, Any]] = {}
     for probe in probes:
         probe = probe.strip()
         if probe not in PROBES:
             print(f"unknown probe {probe!r}; known: {sorted(PROBES)}")
             continue
-        # a fresh trainer per probe: the checkpoint is reloaded inside evaluate()
+        # a fresh trainer per probe; run_probe loads its checkpoint before any intervention
         trainer = Trainer(cfg, output_dir=out_dir / probe)
-        results[probe] = run_probe(trainer, args.checkpoint or None, probe, corruption,
+        results[probe] = run_probe(trainer, args.checkpoint, probe, corruption,
                                   args.sequences, args.frames, args.topk)
         print(f"[{probe}] " + json.dumps({k: round(v, 4)
-                                         for k, v in results[probe].items()}))
+                                         for k, v in results[probe].items()
+                                         if isinstance(v, (float, int))}))
 
-    (out_dir / "diagnostics.json").write_text(json.dumps(results, indent=2))
+    (out_dir / "diagnostics.json").write_text(json.dumps(
+        {
+            # The invocation is part of the result: two runs of this tool that differ only
+            # in `--frames` (10 vs the 30 default) produced 66.60 vs 50.90 SR on the same
+            # checkpoint, and the artifact alone could not say which setting it came from.
+            "invocation": {
+                "config": args.config,
+                "overrides": args.override,
+                "checkpoint": args.checkpoint,
+                "probe": args.probe,
+                "sequences": args.sequences,
+                "frames": args.frames,
+                "token": args.token,
+                "ratio": args.ratio,
+                "severity": args.severity,
+                "target": args.target,
+                "topk": args.topk,
+            },
+            "results": results,
+        }, indent=2))
 
     base = results.get("baseline", {})
     if base:

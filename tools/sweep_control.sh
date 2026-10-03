@@ -1,31 +1,26 @@
-# Is the locality result real, or is window=16 just small enough to contain a burst?
+# How does the local candidate window affect a 2-D block corruption?
 #
-# window=16 gives pearson 0.978 on burst erasure (vs 0.793 with no prior, 0.007 on random
-# erase).  Two explanations fit that number equally well right now:
+# Earlier exploratory runs reported different syndrome correlations across these settings.
+# Re-measure them with degree-matched supports and held-out sequences before interpreting the
+# result. Two explanations can produce a high correlation:
 #
-#   (a) the locality prior aligns H with visual space, so a spatially contiguous burst
+#   (a) the locality prior aligns H with visual space, so a spatially contiguous block
 #       becomes a check-level pattern;
-#   (b) a 40-token burst fits inside a 16-token window, so each check sees either "mostly
-#       wiped" or "mostly fine" -- a much easier target, and nothing to do with geometry.
+#   (b) a window changes the per-check density labels, changing target difficulty as well.
 #
-# (b) is a confound of exactly the kind that produced the obs_energy mistake, so it has to be
-# excluded before any of these numbers go in the paper.  Three runs:
+# (b) changes the label difficulty and must be separated from model efficacy. The runs:
 #
-#   burst_w8    window smaller than the burst -> the easy case should still work, but if the
-#               gain vanishes once the window cannot cover the burst, the target got easier
-#               rather than the prior being useful.
-#   burst_w8_loud  same window, severity 0.8 (much bigger perturbation) -> a real structural
-#               prior should survive; an amplitude effect should not care either way, so this
-#               separates "the signal is spatial" from "the signal is magnitude".
-#   burst_w128  window larger than the grid -> degenerates to (almost) no prior, reproducing
-#               the w=off baseline and confirming the sweep is monotonic in the prior.
+#   block_w3 / block_w5 / block_w7 vary the local candidate window.
+#   block_w5_loud uses a second corruption severity at one geometry.
+#   block_w0 is the nonlocal support control.
 #
-# degree is held at 32 and the obs_energy bypass is OFF throughout, per the previous round.
+# Degree is held at 32 with matching row and column degrees; obs_energy is OFF throughout.
 set -u
 PY=/root/autodl-tmp/lab/envs/gola/bin/python
 CFG=configs/experiment/lasher_vitb_corrupt.yaml
 COMMON="--max-iters 1500 --override train.num_workers=2 --override train.log_every=250 \
-        --override model.syndrome_use_obs_energy=false --override model.h_links_per_check=32"
+        --override model.syndrome_use_obs_energy=false --override model.h_links_per_check=32 \
+        --override model.h_balance_degrees=true --override model.h_free_edge_frac=0.25"
 
 run () {  # name token window severity
   name=$1; tok=$2; win=$3; sev=$4
@@ -38,11 +33,11 @@ run () {  # name token window severity
   echo "launched $name ($tok, window=$win, severity=$sev)"
 }
 
-run burst_w8       tok_burst_erase 8   0.4
-run burst_w8_loud  tok_burst_erase 8   0.8
-run burst_w128     tok_burst_erase 128 0.4
-# the w=16 reference, re-run here so all four share one script and one seed path
-run burst_w16      tok_burst_erase 16  0.4
+run block_w0       tok_block_erase 0 0.4
+run block_w3       tok_block_erase 3 0.4
+run block_w5       tok_block_erase 5 0.4
+run block_w5_loud  tok_block_erase 5 0.8
+run block_w7       tok_block_erase 7 0.4
 
 sleep 5
 tmux ls | grep -c ctrl_

@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Measure every checkpoint from sweep_corruption.sh / sweep_degree.sh.
 #
-# Decision metric (unchanged, and the one the review asked for):
-#   softbce_model < softbce_constant   AND   pearson > 0
-# reported PER CORRUPTION TYPE, with and without the obs_energy bypass, so the claim
-# "the Tanner structure produced the syndrome" can be made on a run that has no label leak.
+# These statistics compare the syndrome with the known density labels and a constant
+# predictor. They do not establish that the graph structure improves recovery or tracking.
 #
 # The measurement corruption MUST match training: the leak is specific to zero-erasure, so
 # measuring a feat_noise-trained model under zero-erasure would say nothing about it.
@@ -44,8 +42,7 @@ row outputs/sw_noise_energy    tok_feat_noise    1 ""
 row outputs/sw_burst_noenergy  tok_burst_erase   0 ""
 row outputs/sw_burst_energy    tok_burst_erase   1 ""
 
-# --- degree sweep, M fixed at 16, bypass OFF --------------------------------------
-for d in 8 12 16 32; do
-  row "outputs/deg_d$d" tok_random_erase 0 "--override model.h_links_per_check=$d"
+# --- degree sweep, M fixed at 16, support balanced -------------------------------
+for d in 32 40 48 64; do
+  row "outputs/deg_d$d" tok_block_erase 0 "--override model.h_links_per_check=$d"
 done
-row outputs/deg_d32_energy tok_random_erase 1 "--override model.h_links_per_check=32"

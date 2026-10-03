@@ -165,9 +165,9 @@ def main() -> int:
     beats = result["softbce_model"] < result["softbce_constant_mean"] - 1e-4
     print(f"\n  model beats a constant predictor: {beats}")
     if not beats:
-        print("  -> the syndrome carries NO information about the corruption; either the")
-        print("     evidence never reaches the head (see delta/ref ratios) or the head")
-        print("     collapses to a constant.  Fix the upstream one first.")
+        print("  -> this probe did not show syndrome information above its constant baseline.")
+        print("     Check the corruption, support degrees, and held-out runs before drawing a")
+        print("     conclusion about whether the graph can use this corruption type.")
     Path(args.out).write_text(__import__("json").dumps(result, indent=2))
     return 0
 

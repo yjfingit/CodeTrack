@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..utils.runtime import CPU_THREAD_SETTINGS
+
 import cv2
 import numpy as np
 import torch
@@ -30,6 +32,7 @@ class Trainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger("codetrack", self.output_dir / "train.log")
+        self.logger.info("CPU thread limits: %s", CPU_THREAD_SETTINGS)
 
         self.seed = int(cfg.get("seed", 0))
         set_seed(self.seed)
@@ -151,6 +154,7 @@ class Trainer:
             "ratio": float(c.get("ratio", 0.2)),
             "severity": float(c.get("severity", 0.4)),
             "both_modalities": bool(c.get("both_modalities", True)),
+            "target": str(c.get("target", "both")),
         }
 
     @torch.enable_grad()
@@ -168,9 +172,13 @@ class Trainer:
         if not params:
             return None
 
-        def grads(loss_key: str) -> Optional[torch.Tensor]:
-            out = self.model(*inputs, corruption=corruption, clean_teacher=True)
-            parts = self.loss_fn(out, target)
+        # Both objectives share one forward and one sampled corruption.  Re-running the
+        # model here compared gradients from different erased tokens and different dropout
+        # draws, which is not a gradient-conflict measurement.
+        out = self.model(*inputs, corruption=corruption, clean_teacher=True)
+        parts = self.loss_fn(out, target)
+
+        def grads(loss_key: str, retain_graph: bool) -> Optional[torch.Tensor]:
             loss = parts.get(f"{loss_key}_graph", parts[loss_key])
             if not torch.isfinite(loss):
                 return None
@@ -180,16 +188,20 @@ class Trainer:
             # meaningless for that arm anyway -- there is no correction gradient to conflict.
             if not loss.requires_grad:
                 return None
-            g = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
-            flat = [x.reshape(-1) for x in g if x is not None]
+            g = torch.autograd.grad(loss, params, retain_graph=retain_graph,
+                                    allow_unused=True)
+            # Preserve parameter-vector alignment: an unused parameter contributes a zero
+            # segment in its original position instead of disappearing from the vector.
+            flat = [(torch.zeros_like(param) if grad is None else grad).reshape(-1)
+                    for param, grad in zip(params, g)]
             return torch.cat(flat) if flat else None
 
         if self.model.decoder.mode == "off":
             # no correction path exists, so there is no conflict to report
             return None
 
-        g_track = grads("track")
-        g_correct = grads("correct")
+        g_track = grads("track", retain_graph=True)
+        g_correct = grads("correct", retain_graph=False)
         if g_track is None or g_correct is None:
             return None
         cos = torch.nn.functional.cosine_similarity(g_track, g_correct, dim=0)
@@ -351,10 +363,10 @@ class Trainer:
             merged = {**self.cfg.get("corruption", {}), **corruption}
             img_cfg = CorruptionConfig.from_dict(merged)
             rng = np.random.default_rng(int(img_cfg.seed or 0))
-            token_cfg = {"enabled": True,
-                         "token": img_cfg.token or ["tok_random_erase"],
-                         "ratio": img_cfg.ratio, "severity": img_cfg.severity,
-                         "target": merged.get("target", "both")}
+            token_cfg = ({"enabled": True, "token": img_cfg.token,
+                          "ratio": img_cfg.ratio, "severity": img_cfg.severity,
+                          "target": merged.get("target", "both")}
+                         if img_cfg.token else None)
 
         diag = {"syndrome": [], "syndrome_y": [], "syndrome_density": [], "syndrome_clean": [],
                 "locator": [], "locator_y": [],
@@ -365,6 +377,11 @@ class Trainer:
             gt = annos[f]
             rgb = cv2.cvtColor(cv2.imread(str(rgb_frames[f])), cv2.COLOR_BGR2RGB)
             tir = cv2.imread(str(tir_frames[f]), cv2.IMREAD_GRAYSCALE)
+            # Keep the pristine pair: with image-level corruption the "clean reference"
+            # pass below must see an undamaged image, otherwise corrupted and clean
+            # syndrome come from the same degraded frame and the AUROC is 0.5 by
+            # construction.
+            rgb_pristine, tir_pristine = rgb, tir
             if img_cfg is not None:
                 rgb, tir = apply_image_corruption(rgb, tir, img_cfg, rng)
 
@@ -389,10 +406,18 @@ class Trainer:
                 # without these negatives the per-check AUROC has a single class and is
                 # undefined (a check watching 32/256 tokens fires on a 20%-corrupted
                 # frame with probability ~0.999).
+                if img_cfg is not None:
+                    clean_rgb = self._crop_resize(rgb_pristine, cx, cy, side, search_size)
+                    clean_tir = self._crop_resize(tir_pristine, cx, cy, side, search_size)
+                    clean_s_rgb = to_tensor(clean_rgb, 3, (0.485, 0.456, 0.406),
+                                            (0.229, 0.224, 0.225))
+                    clean_s_tir = to_tensor(clean_tir, 1, (0.449,), (0.226,))
+                else:
+                    clean_s_rgb, clean_s_tir = s_rgb, s_tir
                 clean_out = self.model(tpl_rgb_t.unsqueeze(0).to(self.device),
-                                       s_rgb.unsqueeze(0).to(self.device),
+                                       clean_s_rgb.unsqueeze(0).to(self.device),
                                        tpl_tir_t.unsqueeze(0).to(self.device),
-                                       s_tir.unsqueeze(0).to(self.device),
+                                       clean_s_tir.unsqueeze(0).to(self.device),
                                        corruption=None)
                 diag["syndrome_clean"].append(
                     clean_out["syndrome"].flatten(1)[0].float().cpu().numpy())
@@ -441,11 +466,18 @@ class Trainer:
             clean = out["clean_tokens"]
             for mod in ("rgb", "tir"):
                 key = f"corrected_{mod}"
-                if key not in out:
+                corrupted_key = f"corrupted_{mod}"
+                # With image-level corruption and no token corruption there is no
+                # ``corrupted_*`` token view at all (the model is called with
+                # ``corruption=None``), and the teacher would be the degraded image's own
+                # features.  Indexing the key used to raise KeyError, which evaluate()
+                # swallowed as "skip <sequence>", so every image-level condition silently
+                # scored zero sequences.
+                if key not in out or corrupted_key not in out:
                     continue
                 ref = clean[mod][0].float()
                 after = (out[key][0].float() - ref).abs().mean(-1)
-                before = (out[f"corrupted_{mod}"][0].float() - ref).abs().mean(-1)
+                before = (out[corrupted_key][0].float() - ref).abs().mean(-1)
                 m = (m_r if mod == "rgb" else m_t)
                 diag["e_before"].append(before[m > 0.5].cpu().numpy())
                 diag["e_after"].append(after[m > 0.5].cpu().numpy())
@@ -470,25 +502,47 @@ class Trainer:
                  max_sequences: Optional[int] = None, max_frames: Optional[int] = None,
                  root: Optional[str] = None,
                  corruption: Optional[Dict[str, Any]] = None,
-                 topk: int = 5) -> Dict[str, float]:
+                 topk: int = 5,
+                 sequence_list: Optional[str] = None) -> Dict[str, float]:
         """Sequence-level PR / SR / NPR, plus the error-correction diagnostics.
 
         With ``corruption`` set, the run also reports syndrome AUROC, localization
         recall@k (against its chance level) and the masked recovery gain / damage --
         the numbers that actually speak to the error-correction claim.
+
+        ``sequence_list`` names a file with one sequence per line and replaces the subset
+        listing.  It defaults to ``None``, so the historical "first N of the subset" path
+        (and every number already computed from it) stays bit-identical.
         """
         if checkpoint:
             report = load_checkpoint(checkpoint, self.model, map_location=str(self.device))
             self.logger.info("loaded checkpoint %s (epoch %s)", checkpoint, report["epoch"])
+            if report["missing"] or report["unexpected"]:
+                # A silently partial load is how a randomly initialised decoder gets
+                # evaluated: load_checkpoint's mode guard catches the arm-level case, this
+                # catches any other key drift.
+                self.logger.warning(
+                    "checkpoint key mismatch: %d missing, %d unexpected (first missing: %s)",
+                    len(report["missing"]), len(report["unexpected"]),
+                    report["missing"][:3] or "none")
         self.model.eval()
 
         data_root = Path(root or self.cfg.get("data", {}).get("root", "data/LasHeR"))
-        list_name = "testingsetList.txt" if subset.startswith("test") else "trainingsetList.txt"
-        seqs = [s.strip() for s in (data_root / list_name).read_text().splitlines() if s.strip()]
+        if sequence_list:
+            seqs = [line.strip() for line in Path(sequence_list).read_text().splitlines()
+                    if line.strip()]
+            self.logger.info("explicit sequence list %s (%d sequences)", sequence_list,
+                             len(seqs))
+        else:
+            list_name = ("testingsetList.txt" if subset.startswith("test")
+                         else "trainingsetList.txt")
+            seqs = [s.strip() for s in
+                    (data_root / list_name).read_text().splitlines() if s.strip()]
         if max_sequences:
             seqs = seqs[:max_sequences]
 
         results = []
+        sequence_metrics = []
         diags: list = []
         skipped: List[str] = []
         for i, seq in enumerate(seqs):
@@ -502,17 +556,20 @@ class Trainer:
             if len(r["pred"]) == 0:
                 skipped.append(f"{seq}: empty prediction")
                 continue
-            results.append({
+            seq_metrics = {
                 "sr": success_auc(r["pred"], r["gt"]),
                 "pr": precision_at(r["pred"], r["gt"], 20.0),
                 "npr": normalized_precision(r["pred"], r["gt"], 0.2),
-            })
+            }
+            results.append(seq_metrics)
+            sequence_metrics.append({"sequence": seq, **seq_metrics})
             if "diagnostics" in r:
                 diags.append(r["diagnostics"])
             if (i + 1) % 20 == 0:
                 self.logger.info("evaluated %d/%d sequences", i + 1, len(seqs))
 
         summary = summarize(results)
+        summary["per_sequence"] = sequence_metrics
         # A silently shortened evaluation is worse than a failed one: metrics computed over
         # half the set look fine and mean nothing.  The valid count is reported explicitly and
         # a large skip rate is surfaced rather than left in the log.

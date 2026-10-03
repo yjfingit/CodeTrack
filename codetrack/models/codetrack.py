@@ -110,10 +110,19 @@ class CodeTrack(nn.Module):
                                        iterations=int(get("bp_iterations", 2)),
                                        links_per_check=int(get("h_links_per_check", 32)),
                                        mode=str(get("decoder_mode", "bp")),
+                                       # 0 keeps the auto width derived from the BP
+                                       # message-function parameter count.  Naming the width
+                                       # is what makes an already-trained MLP arm
+                                       # reproducible: ``outputs/ab_mlp_corr`` was trained
+                                       # with the previous auto formula (2048 hidden) and
+                                       # cannot be rebuilt from the current code without
+                                       # ``model.mlp_hidden=2048``.
+                                       mlp_hidden=int(get("mlp_hidden", 0)),
                                        locality_window=int(get("h_locality_window", 0)),
                                        free_edge_frac=float(get("h_free_edge_frac", 0.25)),
                                        locality_wrap=bool(get("h_locality_wrap", True)),
-                                       weight_init=str(get("h_weight_init", "learned")))
+                                       weight_init=str(get("h_weight_init", "learned")),
+                                       balance_degrees=bool(get("h_balance_degrees", False)))
         self.fusion = CodeTrackFusion(dim=self.dim, fpn_dim=int(get("fpn_dim", 256)),
                                       head_dim=self.dim, grid=self.grid,
                                       taps=self.return_stages,
@@ -197,7 +206,8 @@ class CodeTrack(nn.Module):
 
         dec = self.decoder(x_r, x_t, parity, syn["syndrome"],
                            rel["r_r"], rel["r_t"],
-                           gate_rgb=gate_rgb, gate_tir=gate_tir)
+                           gate_rgb=gate_rgb, gate_tir=gate_tir,
+                           node_index=idx)
 
         fus = self.fusion(dec["corrected_rgb"], dec["corrected_tir"],
                           dec["residual_rgb"], dec["residual_tir"],
@@ -232,6 +242,8 @@ class CodeTrack(nn.Module):
             "residual_tir": dec["residual_tir"],
             "norm_only_rgb": dec.get("norm_only_rgb"),
             "norm_only_tir": dec.get("norm_only_tir"),
+            "pre_norm_rgb": dec.get("pre_norm_rgb"),
+            "pre_norm_tir": dec.get("pre_norm_tir"),
             # lets the loss skip terms that have no gradient path in decoder_mode="off"
             "decoder_off": self.decoder.mode == "off",
             "A_uv": graph["A_uv"],

@@ -208,13 +208,93 @@ def test_mlp_baseline_matches_bp_shapes_and_stays_parameter_matched():
     assert mlp.decoder.mlp_blocks is not None and len(mlp.decoder.mlp_blocks) == 2
     bp_params = sum(p.numel() for p in bp.decoder.parameters())
     mlp_params = sum(p.numel() for p in mlp.decoder.parameters())
-    # the width is derived from dim, so the ratio holds at every scale; the bounds are
-    # loose on the 64-dim toy config and tight (~1.0) at the real 768-dim one
-    assert 0.4 < mlp_params / bp_params < 2.5, \
+    # The MLP width is solved from the BP message-module parameter count.
+    assert 0.98 < mlp_params / bp_params < 1.02, \
         f"baseline not parameter-matched: mlp={mlp_params} bp={bp_params}"
 
     out = mlp.eval()(**dummy_batch(mlp))
     assert out["corrected_rgb"].shape == (2, mlp.num_variables, 64)
+
+
+def test_explicit_mlp_width_overrides_the_auto_formula():
+    """The stored arm in ``outputs/ab_mlp_corr`` was trained at 2048 hidden (the pre-fix
+    auto formula) and cannot be rebuilt without naming the width.  ``mlp_hidden=0`` must stay
+    the auto (parameter-matched) value so the baseline path is unchanged."""
+    auto_cfg = tiny_cfg()
+    auto_cfg["model"]["decoder_mode"] = "mlp"
+    auto = CodeTrack(auto_cfg)
+    auto_hidden = auto.decoder.mlp_blocks[0][0].out_features
+
+    wide_cfg = tiny_cfg()
+    wide_cfg["model"]["decoder_mode"] = "mlp"
+    wide_cfg["model"]["mlp_hidden"] = auto_hidden * 2
+    wide = CodeTrack(wide_cfg)
+
+    assert wide.decoder.mlp_blocks[0][0].out_features == auto_hidden * 2
+    assert (sum(p.numel() for p in wide.decoder.parameters())
+            > sum(p.numel() for p in auto.decoder.parameters()))
+
+
+def test_both_decoder_modes_apply_the_severity_gate_identically():
+    """The MLP baseline must receive the same severity gate as the BP decoder.
+
+    The review's ablation caveat was that the MLP arm had no severity gate, so a full-vs-MLP
+    difference also measured the gate.  Both branches multiply the update by ``(1 - r) *
+    gate``, which a full-grid zero gate makes falsifiable: with the gate closed the pre-norm
+    output must be the untouched input in *both* modes.
+    """
+    for mode in ("bp", "mlp"):
+        cfg = tiny_cfg()
+        cfg["model"]["decoder_mode"] = mode
+        decoder = CodeTrack(cfg).decoder.eval()
+        b, n, d = 1, decoder.num_variables, 64
+        rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+        index = torch.stack([torch.randperm(n)[:8]])
+        empty = torch.zeros(b, n)
+
+        closed = decoder(rgb, tir, torch.randn(b, decoder.num_parity, 32),
+                         torch.rand(b, 1, decoder.num_parity), torch.rand(b, n),
+                         torch.rand(b, n), gate_rgb=empty, gate_tir=empty,
+                         node_index=index)
+        open_ = decoder(rgb, tir, torch.randn(b, decoder.num_parity, 32),
+                        torch.rand(b, 1, decoder.num_parity), torch.rand(b, n),
+                        torch.rand(b, n), gate_rgb=torch.ones(b, n),
+                        gate_tir=torch.ones(b, n), node_index=index)
+
+        assert torch.equal(closed["pre_norm_rgb"], rgb), f"{mode}: closed gate moved tokens"
+        assert torch.equal(closed["pre_norm_tir"], tir), f"{mode}: closed gate moved tokens"
+        assert not torch.allclose(open_["pre_norm_rgb"], rgb), f"{mode}: open gate did nothing"
+
+
+def test_graph_node_gate_is_scattered_to_its_variable_indices():
+    model = CodeTrack(tiny_cfg())
+    index = torch.tensor([[7, 1, 12, 3, 14, 0, 9, 5]])
+    gate = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]])
+
+    expanded = model.decoder._expand_gate(
+        gate, index, batch=1, num_variables=model.num_variables,
+        reference=torch.zeros(1, model.num_variables))
+    expected = torch.ones(1, model.num_variables)
+    expected.scatter_(1, index, gate)
+    assert torch.equal(expanded, expected)
+    assert torch.equal(expanded[0, index[0]], gate[0])
+
+
+def test_zero_gate_preserves_pre_norm_tokens_and_reports_norm_effect():
+    model = CodeTrack(tiny_cfg()).decoder.eval()
+    b, n, d = 1, model.num_variables, 64
+    rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+    index = torch.stack([torch.randperm(n)[:8]])
+    zeros = torch.zeros(b, n)
+    out = model(rgb, tir, torch.randn(b, model.num_parity, 32),
+                torch.rand(b, 1, model.num_parity), torch.rand(b, n), torch.rand(b, n),
+                gate_rgb=zeros, gate_tir=zeros, node_index=index)
+
+    assert torch.equal(out["pre_norm_rgb"], rgb)
+    assert torch.equal(out["pre_norm_tir"], tir)
+    assert torch.count_nonzero(out["residual_rgb"]) == 0
+    assert torch.count_nonzero(out["residual_tir"]) == 0
+    assert not torch.equal(out["corrected_rgb"], rgb)  # post-norm still changes the value
 
 
 def test_fpn_path_can_be_disabled():
@@ -671,6 +751,25 @@ def test_locality_window_zero_is_the_original_uniform_support():
                                links_per_check=24, min_column_degree=2,
                                locality_window=5).connectivity()
     assert spatial_alignment(windowed, 16) < 0.95 * spatial_alignment(uniform, 16)
+
+
+def test_degree_balanced_geometry_groups_have_identical_degree_distributions():
+    from codetrack.models.decoder.bp import NeuralBPDecoder
+
+    supports = []
+    for window in (0, 5, 32):
+        decoder = NeuralBPDecoder(
+            dim=8, num_variables=256, num_parity=16, links_per_check=32,
+            min_column_degree=2, locality_window=window, free_edge_frac=0.25,
+            balance_degrees=True, generator=torch.Generator().manual_seed(0))
+        supports.append(decoder.connectivity())
+
+    row_degrees = [support.sum(dim=1).long().sort().values for support in supports]
+    column_degrees = [support.sum(dim=0).long().sort().values for support in supports]
+    assert all(torch.equal(row_degrees[0], values) for values in row_degrees[1:])
+    assert all(torch.equal(column_degrees[0], values) for values in column_degrees[1:])
+    assert torch.all(row_degrees[0] == 32)
+    assert torch.all(column_degrees[0] == 2)
 
 
 def test_obs_energy_bypass_is_off_by_default():

@@ -1,24 +1,21 @@
 # Two questions, one sweep.
 #
-# (1) L_gain: is it dead weight?  The new logging says gain_active_fraction = 0.00 and
-#     e_ratio_p95 = 0.000, i.e. the hinge is genuinely inactive, not rounded.  The review's
-#     instruction was: only delete it after the definitions agree AND an ablation shows no
-#     change.  lambda_gain = 0 is that ablation.  Also included: beta 0.9 -> 0.8, because if a
-#     larger required margin is wanted the lever is beta, not the weight.
+# (1) L_gain: compare its current setting with a fixed hinge margin after recovery metrics
+#     and training diagnostics have been checked on the same corruption sample.
 #
-# (2) degree, re-swept UNDER the locality prior.  The previous degree sweep was measured with
-#     a uniform random support and is void.  With the window the candidate pool is small
-#     (cand = window cells), so links_per_check above the window size can no longer be
-#     honoured -- that interaction has to be mapped, not assumed.
+# (2) Degree sweep uses a nonlocal support so changing degree does not also change the
+#     candidate window. Balanced supports require at least 32 edges/check for M=16, N=256,
+#     and min variable degree 2.
 #
-# burst corruption throughout, bypass OFF, window 16.
+# Block corruption throughout with obs_energy OFF. L_gain groups use local window 5;
+# degree groups override it to 0 so degree and locality do not move together.
 set -u
 PY=/root/autodl-tmp/lab/envs/gola/bin/python
 CFG=configs/experiment/lasher_vitb_corrupt.yaml
 COMMON="--max-iters 1500 --override train.num_workers=2 --override train.log_every=250 \
-        --override model.syndrome_use_obs_energy=false \
-        --override corruption.token=[tok_burst_erase] \
-        --override model.h_locality_window=16"
+        --override model.syndrome_use_obs_energy=false --override corruption.token=[tok_block_erase] \
+        --override model.h_locality_window=5 --override model.h_balance_degrees=true \
+        --override model.h_links_per_check=32 --override model.h_free_edge_frac=0.25"
 
 run () {  # name extra...
   name=$1; shift
@@ -35,8 +32,9 @@ run gain_off    --override loss.lambda_gain=0.0 --override model.h_links_per_che
 run gain_b08    --override loss.gain_beta=0.8 --override model.h_links_per_check=32
 
 # ---- (2) degree under the locality prior (window 16 => cand = 16 cells) ----
-for d in 4 8 16 24; do
-  run "deg$d" --override model.h_links_per_check=$d
+for d in 32 40 48 64; do
+  run "deg$d" --override model.h_locality_window=0 \
+      --override model.h_links_per_check=$d
 done
 
 sleep 5

@@ -32,6 +32,7 @@ class NeuralBPDecoder(nn.Module):
                  mode: str = "bp", mlp_hidden: int = 0,
                  locality_window: int = 0, free_edge_frac: float = 0.25,
                  locality_wrap: bool = True, weight_init: str = "learned",
+                 balance_degrees: bool = False,
                  generator: Optional[torch.Generator] = None):
         super().__init__()
         self.dim = dim
@@ -39,6 +40,7 @@ class NeuralBPDecoder(nn.Module):
         self.num_parity = num_parity
         self.num_variables = num_variables
         self.mode = mode
+        self.balance_degrees = bool(balance_degrees)
 
         # ---- parity-check matrix H (M x N): a FIXED sparse support, LEARNED weights ----
         #
@@ -48,13 +50,11 @@ class NeuralBPDecoder(nn.Module):
         # **"learned edge weights on a geometrically-constructed fixed sparse support"**,
         # not "learned connectivity".
         #
-        # Locality prior.  With a uniformly random support a spatially contiguous burst is just
-        # "an arbitrary fixed-size set" to every check, so its spatial continuity is washed out
-        # before it reaches check-space.  Measured, the per-check density spread under burst
-        # (0.049) was no better than under independent erasure (0.058): the graph was sensing
-        # combinatorial adjacency, not visual space.  Each check therefore draws its edges from
-        # a local candidate window on the search grid and keeps ``links_per_check`` of them.
+        # Locality prior. Each check draws candidate edges from a search-grid window. The
+        # optional degree-matching path splits the requested budget between local and free
+        # edges; the default legacy sampler is retained when the flag is disabled.
         support = torch.zeros(num_parity, num_variables)
+        local_allowed = torch.ones(num_parity, num_variables, dtype=torch.bool)
         grid = int(round(num_variables ** 0.5))
         spatial = (grid * grid == num_variables) and (grid >= 2)
         if spatial and locality_window > 0:
@@ -76,16 +76,17 @@ class NeuralBPDecoder(nn.Module):
                     dy = torch.minimum(dy, grid - dy)
                     dx = torch.minimum(dx, grid - dx)
                 inside = torch.nonzero((dy <= half) & (dx <= half), as_tuple=False).flatten()
-                pool = inside if inside.numel() >= links_per_check else torch.arange(
+                local_allowed[row] = False
+                local_allowed[row, inside] = True
+                n_free = int(round(free_edge_frac * links_per_check))
+                n_local = links_per_check - n_free if self.balance_degrees else links_per_check
+                pool = inside if inside.numel() >= n_local else torch.arange(
                     num_variables)
-                picked = pool[torch.randperm(pool.numel(), generator=generator)
-                              [:links_per_check]]
+                picked = pool[torch.randperm(pool.numel(), generator=generator)[:n_local]]
                 support[row, picked] = 1.0
 
-            # The unrestricted share, added *after* the local edges so the degree stays
-            # predictable: ``links_per_check`` local + ``n_free`` global.  Previously the free
-            # edges were drawn from whatever the window left over, so the final degree varied
-            # with the window and ``h_links_per_check`` never meant anything.
+            # In legacy mode, add the unrestricted share after the requested local edges. In
+            # degree-matched mode, the local selection above already reserved this share.
             n_free = int(round(free_edge_frac * links_per_check))
             for row in range(num_parity):
                 free = torch.nonzero(support[row] == 0).flatten()
@@ -98,21 +99,56 @@ class NeuralBPDecoder(nn.Module):
                 picked = torch.randperm(num_variables, generator=generator)[:links_per_check]
                 support[row, picked] = 1.0
 
-        # Minimum column degree.  A variable watched by no check can never receive a
-        # correction message, so its "repair" could only come from the local update MLP --
-        # which would silently turn the BP path into decoration.  Note this can push the mean
-        # row degree above ``links_per_check``: with N=256, M=16 and min_column_degree=2 the
-        # support carries at least 2*256/16 = 32 edges per check.  ``h_links_per_check`` is
-        # therefore the *pre-repair* degree, and the realised degree is reported by
-        # ``tools/locality_geometry.py``.
+        # Minimum column degree. A variable watched by no check cannot receive a correction
+        # message. The legacy sampler adds repair edges and may change realized row degrees;
+        # degree-matched runs swap edges instead and require a feasible total edge budget.
         col_degree = support.sum(dim=0)
-        for col in torch.nonzero(col_degree < min_column_degree, as_tuple=False).flatten():
-            while float(support[:, col].sum()) < min_column_degree:
-                free = torch.nonzero(support[:, col] == 0).flatten()
-                if free.numel() == 0:
-                    break
-                pick = int(torch.randint(free.numel(), (1,), generator=generator).item())
-                support[int(free[pick]), col] = 1.0
+        if self.balance_degrees:
+            if links_per_check * num_parity < min_column_degree * num_variables:
+                raise ValueError(
+                    "balanced support cannot meet min_column_degree: increase "
+                    "links_per_check or lower min_column_degree"
+                )
+            # Add a missing incidence by swapping it for an incidence on a column whose
+            # degree exceeds the minimum.  This keeps each row's degree fixed; where
+            # possible it also preserves the local/free-edge category of that row.
+            for col in torch.nonzero(col_degree < min_column_degree,
+                                     as_tuple=False).flatten().tolist():
+                while int(col_degree[col]) < min_column_degree:
+                    rows = torch.nonzero(support[:, col] == 0,
+                                         as_tuple=False).flatten()
+                    rows = rows[torch.randperm(rows.numel(), generator=generator)]
+                    swapped = False
+                    for row_t in rows:
+                        row = int(row_t)
+                        donors = torch.nonzero(
+                            support[row].bool() & (col_degree > min_column_degree),
+                            as_tuple=False).flatten()
+                        if donors.numel() == 0:
+                            continue
+                        same_kind = local_allowed[row, donors] == local_allowed[row, col]
+                        preferred = donors[same_kind]
+                        choices = preferred if preferred.numel() else donors
+                        pick = int(torch.randint(choices.numel(), (1,),
+                                                 generator=generator).item())
+                        donor = int(choices[pick])
+                        support[row, donor] = 0.0
+                        support[row, col] = 1.0
+                        col_degree[donor] -= 1.0
+                        col_degree[col] += 1.0
+                        swapped = True
+                        break
+                    if not swapped:
+                        raise RuntimeError("could not balance parity-check column degrees")
+        else:
+            for col in torch.nonzero(col_degree < min_column_degree,
+                                     as_tuple=False).flatten():
+                while float(support[:, col].sum()) < min_column_degree:
+                    free = torch.nonzero(support[:, col] == 0).flatten()
+                    if free.numel() == 0:
+                        break
+                    pick = int(torch.randint(free.numel(), (1,), generator=generator).item())
+                    support[int(free[pick]), col] = 1.0
 
         self.register_buffer("H_support", support)
         # ``weight_init="uniform"`` freezes the edge weights at 1/degree, i.e. plain
@@ -147,10 +183,27 @@ class NeuralBPDecoder(nn.Module):
         # "mlp" removes message passing entirely and replaces each BP round with a
         # residual MLP of matched width.  If this matches the BP decoder, the whole
         # Tanner-graph story is decoration.
-        # One BP round costs roughly 2 * dim * (3 * dim) parameters; a two-layer MLP
-        # of the same input width costs 3 * hidden * dim, hence hidden ~ 2.7 * dim.
+        # Match the MLP's message-function parameters to the BP message functions.  A
+        # hard-coded width tied to 768 dimensions misses by a large margin on the reference
+        # model and can be worse at smaller test dimensions.
         if mlp_hidden <= 0:
-            mlp_hidden = max(8, int(round(dim * 2048 / 768)))
+            def linear_params(in_features: int, out_features: int) -> int:
+                return in_features * out_features + out_features
+
+            bp_message_params = (
+                linear_params(dim + 1, dim) + linear_params(dim, dim)
+                + linear_params(code_dim, dim)
+                + linear_params(2 * dim + 1, dim) + linear_params(dim, dim)
+                + linear_params(2 * dim, dim) + linear_params(dim, dim)
+            )
+            n_iterations = max(1, iterations)
+            mlp_params_per_hidden = n_iterations * (2 * dim + 2)
+            mlp_fixed_params = n_iterations * dim
+            mlp_hidden = max(
+                8,
+                int(round((bp_message_params - mlp_fixed_params) /
+                          mlp_params_per_hidden)),
+            )
         self.mlp_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim + 1, mlp_hidden), nn.GELU(),   # input is [v, r]
@@ -177,19 +230,46 @@ class NeuralBPDecoder(nn.Module):
         """
         return self._h()
 
+    @staticmethod
+    def _expand_gate(gate: Optional[torch.Tensor], node_index: Optional[torch.Tensor],
+                     batch: int, num_variables: int, reference: torch.Tensor
+                     ) -> torch.Tensor:
+        """Map selected-node gates back to the variable-token grid.
+
+        The graph nodes are sorted by score, so interpolating their values would assign
+        gates to unrelated spatial positions.  Variables omitted from the selected graph
+        receive the neutral multiplier 1; their reliability gate ``(1-r)`` still applies.
+        """
+        if gate is None:
+            return reference.new_ones((batch, num_variables))
+        gate = gate.to(device=reference.device, dtype=reference.dtype)
+        if gate.shape == (batch, num_variables):
+            return gate
+        if node_index is None or gate.shape != node_index.shape:
+            raise ValueError(
+                "gate must cover every variable or match node_index for scatter mapping"
+            )
+        index = node_index.to(device=reference.device, dtype=torch.long)
+        if bool(((index < 0) | (index >= num_variables)).any()):
+            raise ValueError("node_index contains an out-of-range variable index")
+        expanded = reference.new_ones((batch, num_variables))
+        return expanded.scatter(1, index, gate)
+
     # ------------------------------------------------------------------ forward
     def forward(self, variables_rgb: torch.Tensor, variables_tir: torch.Tensor,
                 parity: torch.Tensor, syndrome: torch.Tensor,
                 reliability_rgb: torch.Tensor, reliability_tir: torch.Tensor,
                 gate_rgb: Optional[torch.Tensor] = None,
-                gate_tir: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                gate_tir: Optional[torch.Tensor] = None,
+                node_index: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Dual-modality message passing over one **shared** Tanner graph.
 
         ``variables_rgb`` / ``variables_tir``  ``B x 256 x 768``
         ``parity``      ``B x 16 x 256``
         ``syndrome``    ``B x 1 x 16``
         ``reliability_*``  ``B x 256``
-        ``gate``        ``B x 128`` (optional, from the severity path)
+        ``gate``        ``B x K`` (optional, from the severity path); ``node_index`` maps
+                        those K selected graph nodes back to the N-token variable grid.
 
         Returns ``corrected_rgb``, ``corrected_tir``, ``residual_rgb``, ``residual_tir``,
         each ``B x 256 x 768`` -- matching "Corrected zg / Corrected xg / Residual" in
@@ -204,23 +284,32 @@ class NeuralBPDecoder(nn.Module):
             zeros = torch.zeros_like(variables_rgb)
             return {"corrected_rgb": variables_rgb, "corrected_tir": variables_tir,
                     "residual_rgb": zeros, "residual_tir": zeros,
-                    "norm_only_rgb": variables_rgb, "norm_only_tir": variables_tir}
+                    "norm_only_rgb": variables_rgb, "norm_only_tir": variables_tir,
+                    "pre_norm_rgb": variables_rgb, "pre_norm_tir": variables_tir}
 
         b = variables_rgb.shape[0]
         v = torch.cat([variables_rgb, variables_tir], dim=0)       # 2B x 256 x 768
         r = torch.cat([reliability_rgb, reliability_tir], dim=0).unsqueeze(-1)
+        gate_r = self._expand_gate(gate_rgb, node_index, b, v.shape[1], variables_rgb)
+        gate_t = self._expand_gate(gate_tir, node_index, b, v.shape[1], variables_tir)
+        gate_full = torch.cat([gate_r, gate_t], dim=0).unsqueeze(-1)
         total_delta = torch.zeros_like(v)
 
         if self.mode == "mlp":
             # no parity-check matrix, no messages: a matched residual denoiser
             for block in self.mlp_blocks:
                 delta = block(torch.cat([v, r], dim=-1))
-                v = v + (1.0 - r) * delta
-                total_delta = total_delta + (1.0 - r) * delta
-            v = self.out_norm(v)
+                delta = (1.0 - r) * gate_full * delta
+                v = v + delta
+                total_delta = total_delta + delta
+            pre_norm = v
+            norm_only = self.out_norm(torch.cat([variables_rgb, variables_tir], dim=0))
+            v = self.out_norm(pre_norm)
             return {
                 "corrected_rgb": v[:b], "corrected_tir": v[b:],
                 "residual_rgb": total_delta[:b], "residual_tir": total_delta[b:],
+                "norm_only_rgb": norm_only[:b], "norm_only_tir": norm_only[b:],
+                "pre_norm_rgb": pre_norm[:b], "pre_norm_tir": pre_norm[b:],
             }
 
         # ---- belief propagation ---------------------------------------------------
@@ -244,21 +333,16 @@ class NeuralBPDecoder(nn.Module):
 
             # ---- Update: v <- v + (1 - r) * gate * delta ---------------------------
             delta = self.update(torch.cat([v, m_cv], dim=-1))      # 2B x 256 x 768
-            if gate_rgb is not None or gate_tir is not None:
-                g_rgb = gate_rgb if gate_rgb is not None else torch.ones_like(reliability_rgb)
-                g_tir = gate_tir if gate_tir is not None else torch.ones_like(reliability_tir)
-                g = torch.cat([g_rgb, g_tir], dim=0) if g_rgb.shape[0] == b else g_rgb
-                g = F.interpolate(g.unsqueeze(1), size=v.shape[1], mode="linear",
-                                  align_corners=False).transpose(1, 2)
-                delta = delta * g
-            v = v + (1.0 - r) * delta
-            total_delta = total_delta + (1.0 - r) * delta
+            delta = (1.0 - r) * gate_full * delta
+            v = v + delta
+            total_delta = total_delta + delta
 
         # norm-only control: the decoder's output LayerNorm applied to the *uncorrected*
         # input.  It isolates the pure scale change from the message updates, so a negative
         # recovery_gain can be attributed (or not) to the Tanner messages.
+        pre_norm = v
         norm_only = self.out_norm(torch.cat([variables_rgb, variables_tir], dim=0))
-        v = self.out_norm(v)
+        v = self.out_norm(pre_norm)
         return {
             "corrected_rgb": v[:b],
             "corrected_tir": v[b:],
@@ -266,4 +350,6 @@ class NeuralBPDecoder(nn.Module):
             "residual_tir": total_delta[b:],
             "norm_only_rgb": norm_only[:b],
             "norm_only_tir": norm_only[b:],
+            "pre_norm_rgb": pre_norm[:b],
+            "pre_norm_tir": pre_norm[b:],
         }

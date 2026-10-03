@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Measure the control sweep (is window=16 real?) and the gain/degree sweep.
+# Measure the 2-D block-window control sweep and the gain/degree sweep.
 #
-# Metric, unchanged: softbce_model < softbce_constant AND pearson > 0, measured with the
-# obs_energy bypass OFF and under the corruption the checkpoint was trained on.
+# These statistics measure syndrome/density association. They do not by themselves establish
+# feature recovery, graph-specific benefit, or improved tracking.
 set -u
 PY=/root/autodl-tmp/lab/envs/gola/bin/python
 cd /root/autodl-tmp/lab/projects/CodeTrack
@@ -34,17 +34,18 @@ fit () {  # dir name token window severity
   show "$o" "$name"
 }
 
-# ---- control sweep: window 8 / 8+loud / 128 / 16 (all burst) ----
-fit outputs/ctrl_burst_w8      burst_w8      tok_burst_erase 8   0.4
-fit outputs/ctrl_burst_w8_loud burst_w8_loud tok_burst_erase 8   0.8
-fit outputs/ctrl_burst_w128    burst_w128    tok_burst_erase 128 0.4
-fit outputs/ctrl_burst_w16     burst_w16     tok_burst_erase 16  0.4
+# ---- block-window sweep ----
+fit outputs/ctrl_block_w0      block_w0      tok_block_erase 0 0.4
+fit outputs/ctrl_block_w3      block_w3      tok_block_erase 3 0.4
+fit outputs/ctrl_block_w5      block_w5      tok_block_erase 5 0.4
+fit outputs/ctrl_block_w5_loud block_w5_loud tok_block_erase 5 0.8
+fit outputs/ctrl_block_w7      block_w7      tok_block_erase 7 0.4
 
-# ---- L_gain ablation (burst, window 16, degree 32) ----
-fit outputs/gd_gain_on  gain_on  tok_burst_erase 16 0.4
-fit outputs/gd_gain_off gain_off tok_burst_erase 16 0.4
+# ---- L_gain ablation (block, window 5, degree 32) ----
+fit outputs/gd_gain_on  gain_on  tok_block_erase 5 0.4
+fit outputs/gd_gain_off gain_off tok_block_erase 5 0.4
 
-# ---- degree under the locality prior (window 16) ----
-for d in 4 8 16 24; do
-  fit "outputs/gd_deg$d" "loc_deg$d" tok_burst_erase 16 0.4
+# ---- degree with nonlocal support ----
+for d in 32 40 48 64; do
+  fit "outputs/gd_deg$d" "deg$d" tok_block_erase 0 0.4
 done

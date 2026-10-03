@@ -31,9 +31,32 @@ def save_checkpoint(path: Union[str, Path], model, optimizer=None, epoch: int = 
 
 def load_checkpoint(path: Union[str, Path], model, optimizer=None,
                     map_location: str = "cpu", strict: bool = False) -> Dict[str, Any]:
-    """Load a checkpoint into ``model``; returns a short report."""
+    """Load a checkpoint into ``model``; returns a short report.
+
+    A checkpoint carries the resolved config it was trained with, and the decoder *mode*
+    changes which parameters exist at all: loading an ``off`` arm into a model built for
+    ``bp`` used to leave 16 message-passing tensors at their random initialisation, silently,
+    because ``strict=False`` only reports the keys in a list nobody read.  Evaluation then
+    measured a randomly wired decoder.  A mode mismatch is therefore an error; missing or
+    unexpected keys are returned (and logged by the caller) so a shape drift cannot hide.
+    """
     ckpt = torch.load(str(path), map_location=map_location, weights_only=False)
     state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    stored = (ckpt.get("config") or {}) if isinstance(ckpt, dict) else {}
+    stored_model = stored.get("model", {}) if isinstance(stored, dict) else {}
+    live = getattr(model, "cfg", None) or {}
+    live_model = live.get("model", {}) if isinstance(live, dict) else {}
+    stored_mode = stored_model.get("decoder_mode")
+    live_mode = live_model.get("decoder_mode", "bp")
+    if stored_mode and stored_mode != live_mode:
+        raise RuntimeError(
+            f"{path} was trained with model.decoder_mode={stored_mode!r} but the model is "
+            f"built with {live_mode!r}. Load it with "
+            f"--override model.decoder_mode={stored_mode} (or build the matching config); "
+            "loading it as-is leaves that arm's parameters randomly initialised."
+        )
+
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if optimizer is not None and isinstance(ckpt, dict) and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])

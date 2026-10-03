@@ -77,6 +77,9 @@ s_j = D( phi({v_i : i in N(j)}), p_j )
 - **Error Locator** uses sparsity: if checks `{2,7,9}` all fire and all connect `v_R^17`,
   then `v_R^17` is the prime suspect.
 - **Error Severity / Reliability-Aware Gating**: `B x 1 x 128`
+- The 128 selected-node gate values are scattered by `node_index` onto the 256-position
+  variable grid. Unselected variables use the neutral severity multiplier `1`; their
+  reliability factor `(1-r)` still controls the update.
 
 ## 6. Neural BP Decoder — `codetrack/models/decoder/`
 
@@ -108,7 +111,7 @@ Update:             v_i^{(l+1)} = v_i^{(l)} + (1 - r_i) * dv_i^{(l)}
 |---|---|
 | RGB | low-light, over-exposure, blur, occlusion, color degradation |
 | TIR | thermal saturation, thermal crossover, noise, contrast loss |
-| Token | random erasure, burst erasure, feature noise |
+| Token | random erasure, flattened burst erasure, 2-D block erasure, feature noise |
 | Cross-modal | spatial shift, scale shift, temporal delay |
 
 Corruption positions are known at training time, enabling a supervised syndrome loss.
@@ -334,14 +337,15 @@ Two of these had to be fixed because the metric itself was wrong, not the model:
 - `recall_at_k` ranked the whole corpus' tokens jointly, so the top-k always came from whichever
   frames were worst. It now ranks within each frame and averages.
 
-**`tools/diagnostics.py`** runs the perturbations that would expose decoration:
+**`tools/diagnostics.py`** runs perturbations that test whether predictions depend on the
+intervened paths. They are diagnostic evidence, not stand-alone proofs:
 
-| probe | what it breaks | a real ECC model should |
+| probe | what it breaks | result to inspect |
 |---|---|---|
-| `shuffle-incidence` | permutes the columns of `H` (which variable each check watches) | degrade sharply |
-| `shuffle-parity` | permutes the parity order | degrade |
-| `shuffle-syndrome` | permutes the syndrome entries | degrade |
-| `no-decoder` | bypasses the BP decoder entirely | tracking collapses, `recovery_gain` becomes exactly 0 |
+| `shuffle-incidence` | permutes the columns of `H` (which variable each check watches) | paired change in recovery and tracking metrics |
+| `shuffle-parity` | permutes the parity order | paired change in recovery and tracking metrics |
+| `shuffle-syndrome` | permutes the syndrome entries | paired change in recovery and tracking metrics |
+| `no-decoder` | bypasses the BP decoder entirely | change in tracking and recovery metrics |
 
 Run it with:
 
@@ -349,8 +353,8 @@ Run it with:
 python tools/diagnostics.py --checkpoint outputs/<exp>/final.pth --sequences 5
 ```
 
-The rule is simple and deliberately blunt: **a probe that does not hurt the metrics is
-decoration, not correction.**
+A null result is inconclusive on its own: check that the intervention is applied after loading,
+matches the checkpoint's training condition, and is measured on enough held-out sequences.
 
 ### 11.9 Architecture-property tests
 
@@ -479,42 +483,26 @@ the numerical leak.
 `model.syndrome_use_obs_energy` now defaults to **false**. The decoder may still use an
 observation-quality cue; the syndrome head does not.
 
-### 13.2 What it invalidated (all numbers, 1500 steps, bypass on/off)
+### 13.2 What the leak requires us to re-measure
 
-| corruption | obs_energy | pearson | softbce | constant | beats |
-|---|---|---|---|---|---|
-| random erase | off | 0.0069 | 0.6535 | 0.6529 | no |
-| random erase | **on** | **0.3935** | 0.6525 | 0.6529 | yes |
-| feat noise | off | 0.0000 | 0.6532 | 0.6525 | no |
-| feat noise | on | 0.0052 | 0.6532 | 0.6525 | no |
-| **burst erase** | **off** | **0.7930** | **0.6402** | 0.6472 | **yes** |
-| burst erase | on | 0.8143 | 0.6427 | 0.6472 | yes |
+Earlier probes showed that `obs_energy` can expose the random-erasure density label directly.
+Those numbers do not establish that the Tanner structure is useless under independent
+erasure, or that burst erasure is the only recoverable condition. Re-measure with
+`syndrome_use_obs_energy=false`, exact corruption masks, matched realized support degrees,
+and held-out sequences. `tools/syndrome_fit.py` measures the syndrome against a constant
+baseline; `tools/recovery_probe.py` separately measures feature recovery.
 
-Two conclusions, one of them inconvenient:
+Feature noise, zero erasure, and energy-matched replacement produce different observable
+signals. Keep them as distinct protocols and do not infer performance in one from another.
 
-1. **Every earlier random-erase number was the bypass.** 0.394 -> 0.007 once removed. The
-   Tanner structure contributed nothing under independent erasure.
-2. **Burst erasure is the setting where the syndrome is genuinely informative without the
-   leak**, and its density spread is the widest of the three (std 0.094 vs 0.071 / 0.072).
+### 13.3 Match realized graph degrees in geometry comparisons
 
-`feat_noise` fails either way, as predicted: additive noise does not collapse the
-neighbourhood energy, so there is no local energy signature, and the corruption is not
-spatially structured either.
-
-### 13.3 The degree sweep was confounded too
-
-With `M = 16` fixed and the bypass **off**, `h_links_per_check` = 8 / 12 / 16 / 32 give
-pearson 0.025 / 0.011 / 0.015 / 0.008 -- none beats the constant.
-
-The earlier "degree 8 gives pearson 0.792" was measured with the bypass **on**, i.e. two
-variables moved at once. Raising `M` from 16 to 32 at the same time (which also raises the
-total edge count, the average token's check-degree and the support overlap) made things
-worse, 0.792 -> 0.142, and the confound is why: `M` alone does not widen a single check's
-density distribution.
-
-Lesson recorded in `tools/sweep_degree.sh`: fix `M`, sweep one axis, and re-measure with the
-bypass off. The lesson I did not apply the first time is that any new axis needs the leak
-re-checked before its numbers mean anything.
+The support constructor can add edges to satisfy a minimum variable degree, so equal
+`h_links_per_check` settings do not guarantee equal realized degrees. Geometry comparisons
+should use `h_balance_degrees=true` and audit the row and column degree distributions with
+`tools/locality_geometry.py --audit-only` before training. Degree and parity-count sweeps
+must vary one quantity at a time or explicitly control total edges and average variable
+degree.
 
 ### 13.4 One definition of the recovery numbers
 
@@ -531,18 +519,14 @@ The evaluation reports a distribution, not a rounded mean:
 | `e_after_over_before` | the recovery ratio; < 1 means the decoder helps |
 | `e_ratio_p95` | the worst-case frame, which the mean hides |
 
-First reading on the new logging: `gain_active_fraction = 0.00`, `e_ratio_p95 = 0.000`. The
-hinge really is inactive, not merely rounded -- but the weights are left alone until the
-definitions have been compared on the same batch, since a hinge that has been satisfied
-once may still have pushed the solution into the feasible set.
+Interpret the hinge together with the four output cells in `tools/recovery_probe.py`; its
+feature-space result depends on the same masks and target-aligned crop.
 
 ### 13.5 Locality prior on H (`h_locality_window`, default off)
 
-A uniformly random support means a spatially contiguous burst is still just an arbitrary
-fixed-size set to every check, so its spatial continuity is washed out before it reaches
-check-space -- which is why burst's density spread (0.049) was originally no better than
-independent erasure's (0.058). But burst is exactly where the syndrome works, so some
-alignment already matters.
+A uniformly random support removes an explicit spatial prior, while a local candidate window
+encodes one. Measure whether that prior helps using matched realized degrees, feature
+recovery, and tracking metrics; density spread alone is not model evidence.
 
 Each check now draws its edges from a **local candidate window** on the search grid (with a
 circular distance so the window wraps instead of biasing the frame edge) and still *learns*
