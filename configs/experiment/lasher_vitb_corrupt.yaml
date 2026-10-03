@@ -1,7 +1,13 @@
-# Robustness experiment: same model evaluated under the corruption protocol.
+# Robustness experiment: CodeTrack trained and evaluated under the corruption protocol.
+#
+# Token-level corruption is the setting the four-term objective is built for:
+#   L = L_track + 1.0 * L_detect + 2.0 * L_correct + 0.1 * L_identity
 _base_: ../experiment/lasher_vitb.yaml
 
 corruption:
   enabled: true
-  level: mixed
-  protocol: configs/corruption
+  level: token
+  token: [tok_random_erase]
+  ratio: 0.2
+  severity: 0.4
+  both_modalities: true

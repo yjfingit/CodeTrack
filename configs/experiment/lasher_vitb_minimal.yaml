@@ -1,0 +1,16 @@
+# Minimal viability experiment: only the first three loss terms.
+#
+#   L = L_track + 1.0 * L_detect + 2.0 * L_correct
+#
+# Purpose: verify the core claim before adding any extra regularisation -- can the
+# belief-propagation decoder recover corrupted target tokens (L_correct going down)
+# and does the model detect where the corruption is (L_detect going down)?
+_base_: ../experiment/lasher_vitb_corrupt.yaml
+
+loss:
+  lambda_detect: 1.0
+  lambda_correct: 2.0
+  lambda_identity: 0.0
+
+train:
+  codec_warmup_epochs: 1

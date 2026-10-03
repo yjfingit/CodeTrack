@@ -2,3 +2,7 @@
 
 See docs/architecture.md section 7.
 """
+
+from .fusion import CodeTrackFusion
+
+__all__ = ["CodeTrackFusion"]

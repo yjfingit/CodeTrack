@@ -2,7 +2,8 @@
 corruption:
   enabled: true
   level: token
-  type: tok_random_erase
+  token: [tok_random_erase]
   ratio: 0.4
   severity: 0.4
+  both_modalities: true
   seed: 0

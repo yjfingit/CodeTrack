@@ -125,4 +125,74 @@ Corruption positions are known at training time, enabling a supervised syndrome 
 | Neural BP Decoder | `codetrack/models/decoder/` |
 | Fusion, residual, reshape | `codetrack/models/fusion/` |
 | Tracking head | `codetrack/models/head/` |
-| Losses (`L_track`, `L_corr`, `L_syn`, `L_parity`) | `codetrack/engine/losses.py` |
+| Losses (`L_track`, `L_detect`, `L_correct`, `L_identity`) | `codetrack/engine/losses.py` |
+
+---
+
+## 10. Implementation notes (how the figure maps onto this repository)
+
+Every place where the figure leaves room for interpretation, and what the code does.
+
+### 10.1 Backbone: OSTrack ViT-B/16 with absolute position embeddings
+
+The figure annotates the stack as `12 Blocks, Frozen, RoPE, Abs. Pos`. Because the
+requirement is to **reuse OSTrack's public weights directly**, the implementation keeps
+OSTrack's absolute position embeddings and does **not** use RoPE -- re-deriving RoPE
+would invalidate the pretrained weights. Attention, MLP blocks, patch embedding and
+position embeddings are ported from OSTrack (`lib/models/ostrack/vit.py`, Apache-2.0)
+and stay bit-compatible, so `OSTrack_ep0300.pth.tar` loads with no key surgery
+(**151 tensors**, verified; the search/template position grids come from the checkpoint
+itself, so they are equally exact).
+
+* RGB keeps the pretrained 3-channel patch embedding.
+* TIR gets a **separate 1-channel** patch embedding initialised as the channel-mean of
+  the RGB filter -- a thermal frame is approximately the luminance of the visible frame.
+  The figure draws one `Patch Embed` box per modality, which this matches.
+* The 12 transformer blocks are **shared** across modalities and frozen
+  (`freeze_backbone: true`).
+* If a checkpoint has no `pos_embed_z` / `pos_embed_x`, they are re-derived by bicubic
+  interpolation from `pos_embed`, exactly as OSTrack's `finetune_track` does.
+
+### 10.2 Why `A_uv` is `128 x 128`
+
+The selector keeps the best **128 of the 256** variable nodes as graph nodes, so their
+pairwise affinity matrix is `128 x 128` with the 16 parity tokens as 16 check nodes
+(`16 x 128` after embedding). `Softmax_s` is a **sparsified softmax**: only the top-8
+affinities per row survive before renormalisation. That sparsity is a functional
+requirement, not a speed trick -- it is what lets a failing-check pattern vote for one
+specific token during localization.
+
+### 10.3 Why FPN is 512 per modality while the head still sees 768
+
+Block-2 and block-5 taps are each projected to 256 channels and concatenated, giving
+exactly the figure's `B x 512 x 16 x 16` per modality. The two modalities are then
+fused back to **768** so the tracking head can reuse OSTrack's head weights
+(90/92 tensors; the two skipped entries are the fixed coordinate grids, which are
+buffers rather than trained weights).
+
+### 10.4 The correction path is dual-modality over one shared graph
+
+`Corrected zg` and `Corrected xg` in the figure are the RGB and TIR tokens repaired by
+the **same** parity-check matrix `H` (`16 x 256`, sparse) driven by the **same**
+syndrome. Both modalities are stacked along the batch dimension, so the two repairs
+cost a single fused forward pass.
+
+### 10.5 Verified tensor shapes
+
+`python tools/check_shapes.py --ckpt checkpoints/pretrained/OSTrack_ep0300.pth.tar`
+audits a forward pass against the figure and currently reports **21/21 tensors OK**,
+from `z_r: (1, 64, 768)` through `bbox: (1, 4)`.
+
+### 10.6 Parameters
+
+| module | trainable / total |
+|---|---|
+| backbone (frozen) | 0.003 M / 86.244 M |
+| codebook | 5.983 M |
+| reliability + selector | 1.578 M |
+| tanner | 0.495 M |
+| syndrome + locator + gating | 0.163 M |
+| decoder (BP) | 4.928 M |
+| fusion | 6.885 M |
+| head | 6.474 M |
+| **total** | **26.51 M trainable / 112.75 M** |

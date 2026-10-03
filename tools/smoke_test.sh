@@ -5,11 +5,14 @@ set -euo pipefail
 OUT="outputs/smoke"
 mkdir -p "${OUT}"
 
-echo "[smoke] running 20 iterations on a tiny subset ..."
-python -m codetrack.cli.train \
-  --config configs/experiment/lasher_vitb.yaml \
+PY="${PYTHON_BIN:-python}"
+CONFIG="${1:-configs/experiment/lasher_vitb_minimal.yaml}"
+
+echo "[smoke] config=${CONFIG}  out=${OUT}"
+"${PY}" -m codetrack.cli.train \
+  --config "${CONFIG}" \
   --out-dir "${OUT}" \
-  --max-iters 20 \
-  --subset 8 2>&1 | tee "${OUT}/smoke.log"
+  --max-iters 30 \
+  --subset 96 2>&1 | tee "${OUT}/smoke.log"
 
 echo "[smoke] done. Check ${OUT}/smoke.log"

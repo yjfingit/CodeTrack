@@ -3,3 +3,7 @@
 Produces per-token reliability r_i and selects the N variable nodes fed to the Tanner graph.
 See docs/architecture.md section 3.
 """
+
+from .reliability import ReliabilityEstimator, TargetCandidateSelector
+
+__all__ = ["ReliabilityEstimator", "TargetCandidateSelector"]

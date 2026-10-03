@@ -99,14 +99,40 @@ Opposite of early-exit trackers: spend *more* error-correction budget as corrupt
 
 ## 10. Training losses
 
-```text
-L_corr  = || F_hat - F_clean ||_1
-L_syn   = BCE(M_hat_err, M_err)            # corruption positions known at train time
-L_track = L_cls + lambda1 * L_L1 + lambda2 * L_GIoU
-L       = L_track + lambda_c * L_corr + lambda_s * L_syn + lambda_p * L_parity
-```
+Four terms, with the reference weights ``lambda_d = 1.0``, ``lambda_c = 2.0``,
+``lambda_i = 0.1``::
 
-A clean teacher supplies `F_clean`; corrupt views supply `F_corrupt`.
+    L = L_track + lambda_d * L_detect + lambda_c * L_correct + lambda_i * L_identity
+
+| Term | Supervision | Why it is needed |
+|---|---|---|
+| `L_track` | focal (centre heatmap) + L1 + GIoU on the predicted box | keeps the tracker itself learning while the correction machinery is trained |
+| `L_detect` | BCE on reliability vs. the known token-corruption mask; BCE on the syndrome vs. per-check corruption; BCE on the locator vs. the per-token mask | without it the syndrome can collapse to a constant, and "detection" carries no information. **The model must find the corruption, not merely survive it.** |
+| `L_correct` | `L1(corrected_tokens, clean_teacher_tokens)` for both modalities, weight **2.0** | this is the core claim: the BP decoder must actually restore the corrupted feature. It is supervised directly against the clean tokens rather than only through the tracking loss. |
+| `L_identity` | distillation over the identity codebook: the soft assignment of a repaired token over `U` must match that of its clean counterpart, weight 0.1 | stops the decoder from "repairing" a token onto a **look-alike distractor** (another person, a similar vehicle) instead of the tracked target |
+
+### The clean teacher
+
+`L_correct` and `L_identity` need a corruption-free reference. It is obtained from the
+**same forward pass**: the frozen backbone is executed once and its tokens are branched
+into a corrupted and a clean path; only the CodeTrack modules are run twice, and the
+clean branch is wrapped in `no_grad`. Measured overhead on the reference
+configuration: none on the backbone, roughly one extra pass over the ~26 M trainable
+parameters.
+
+### Staged training
+
+`train.codec_warmup_epochs` (default 1) freezes everything except the codebook and the
+BP decoder for the first epochs, so detection + repair are learned before the rest of
+the network starts adapting. Afterwards everything except the backbone is unfrozen for
+joint fine-tuning.
+
+### Minimal viability configuration
+
+`configs/experiment/lasher_vitb_minimal.yaml` disables `L_identity`
+(`lambda_identity: 0.0`) so the first experiment answers one question only: can the
+decoder recover corrupted target tokens (`L_correct` falls) and does the model localize
+them (`L_detect` falls)?
 
 ## 11. Relation to prior art
 

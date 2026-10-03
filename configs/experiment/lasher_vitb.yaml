@@ -1,15 +1,16 @@
-# Main experiment: CodeTrack ViT-B/16 on LasHeR.
+# Main experiment: CodeTrack ViT-B/16 on LasHeR (train split only).
 _base_: ../default.yaml
 
 data:
   dataset: lasher
-  root: data/LasHeR
+  root: /root/autodl-tmp/lab/dataset/LasHeR
   batch_size: 8
   num_workers: 4
+  samples_per_epoch: 131072
 
 train:
   epochs: 10
-  samples_per_epoch: 131072
+  lr: 0.0001
   batch_size: 8
 
 eval:

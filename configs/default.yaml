@@ -5,27 +5,57 @@ device: cuda
 model:
   name: codetrack
   backbone: vitb_shared
-  pretrained: false
+  # OSTrack ViT-B/16 checkpoint; initialises the shared backbone AND the tracking head
+  pretrained: checkpoints/pretrained/OSTrack_ep0300.pth.tar
   img_size: 256
   template_size: 128
   patch_size: 16
   embed_dim: 768
   depth: 12
   num_heads: 12
+  return_stages: [2, 5]
+  freeze_backbone: true
+  tir_from_rgb: true
+  # ---- CodeTrack blocks (architecture figure) ----
+  code_dim: 256          # ECC projection output width
+  check_dim: 128         # check-node embedding width
   num_identity_tokens: 16
   num_parity_tokens: 16
+  parity_links: 4        # ones per row of the sparse parity matrix A
   num_variable_nodes: 256
+  num_graph_nodes: 128
+  graph_top_k: 8
   bp_iterations: 2
-  uep: false
+  h_links_per_check: 32
+  fpn_dim: 256
+  head_type: CENTER
+  head_channel: 256
+  discrepancy: learned
+  dropout: 0.0
 
 data:
   dataset: lasher
-  root: data/LasHeR
+  root: /root/autodl-tmp/lab/dataset/LasHeR
+  template_size: 128
+  search_size: 256
   num_workers: 4
   batch_size: 8
+  samples_per_epoch: 131072
+  search_factor: 4.0
+  template_factor: 2.0
 
 corruption:
   enabled: false
+  level: mixed
+  rgb: []
+  tir: []
+  # token-level corruption is what L_detect / L_correct are trained against
+  token: [tok_random_erase]
+  ratio: 0.2
+  severity: 0.4
+  cross_modal: false
+  probability: 1.0
+  both_modalities: true
 
 train:
   epochs: 10
@@ -34,11 +64,19 @@ train:
   weight_decay: 0.0001
   grad_clip: 1.0
   amp: true
+  log_every: 10
+  # stage 1: train codebook + BP decoder only for N epochs, then joint fine-tuning
+  codec_warmup_epochs: 1
 
 loss:
-  lambda_corr: 1.0
-  lambda_syn: 1.0
-  lambda_parity: 0.1
+  # L = L_track + 1.0 * L_detect + 2.0 * L_correct + 0.1 * L_identity
+  cls: 1.0
+  l1: 5.0
+  giou: 2.0
+  lambda_detect: 1.0
+  lambda_correct: 2.0
+  lambda_identity: 0.1
+  clean_teacher: true
 
 eval:
   metrics: [pr, sr, npr]
