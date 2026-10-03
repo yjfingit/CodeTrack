@@ -12,7 +12,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..data.datasets import build_dataset
+from ..data.corruption.corruption import CorruptionConfig, apply_image_corruption
 from ..metrics import normalized_precision, precision_at, success_auc, summarize
+from .evaluator import summarize_detection, summarize_recovery
 from ..models.codetrack import CodeTrack
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
 from ..utils.logging import get_logger
@@ -235,8 +237,15 @@ class Trainer:
 
     @torch.no_grad()
     def infer_sequence(self, root: Path, subset: str, seq: str,
-                       max_frames: Optional[int] = None) -> Dict[str, np.ndarray]:
-        """Run the tracker over one sequence and return predicted / ground-truth boxes."""
+                       max_frames: Optional[int] = None,
+                       corruption: Optional[Dict[str, Any]] = None,
+                       collect: bool = False) -> Dict[str, Any]:
+        """Run the tracker over one sequence.
+
+        With ``corruption`` the frames are degraded (image level + token level) exactly as
+        during training, and with ``collect`` the per-frame error-correction diagnostics
+        are accumulated alongside the boxes.
+        """
         rgb_frames = self._sequence_frames(root, subset, seq, "visible")
         tir_frames = self._sequence_frames(root, subset, seq, "infrared")
         anno_path = root / "annos" / f"{seq}.txt"
@@ -269,10 +278,29 @@ class Trainer:
 
         prev = g0.copy()
         preds, gts = [], []
+
+        img_cfg = None
+        token_cfg = None
+        rng = None
+        if corruption:
+            merged = {**self.cfg.get("corruption", {}), **corruption}
+            img_cfg = CorruptionConfig.from_dict(merged)
+            rng = np.random.default_rng(int(img_cfg.seed or 0))
+            token_cfg = {"enabled": True,
+                         "token": img_cfg.token or ["tok_random_erase"],
+                         "ratio": img_cfg.ratio, "severity": img_cfg.severity,
+                         "target": merged.get("target", "both")}
+
+        diag = {"syndrome": [], "syndrome_y": [], "syndrome_clean": [],
+                "locator": [], "locator_y": [],
+                "e_before": [], "e_after": [], "e_clean": []}
+
         for f in range(n):
             gt = annos[f]
             rgb = cv2.cvtColor(cv2.imread(str(rgb_frames[f])), cv2.COLOR_BGR2RGB)
             tir = cv2.imread(str(tir_frames[f]), cv2.IMREAD_GRAYSCALE)
+            if img_cfg is not None:
+                rgb, tir = apply_image_corruption(rgb, tir, img_cfg, rng)
 
             cx, cy = prev[0] + prev[2] / 2, prev[1] + prev[3] / 2
             side = float(np.sqrt(max(prev[2], 1) * max(prev[3], 1))) * sf
@@ -285,8 +313,23 @@ class Trainer:
             out = self.model(tpl_rgb_t.unsqueeze(0).to(self.device),
                              s_rgb.unsqueeze(0).to(self.device),
                              tpl_tir_t.unsqueeze(0).to(self.device),
-                             s_tir.unsqueeze(0).to(self.device))
+                             s_tir.unsqueeze(0).to(self.device),
+                             corruption=token_cfg, clean_teacher=bool(collect))
             box = out["bbox"][0].float().cpu().numpy()          # cx, cy, w, h in [0, 1]
+
+            if collect:
+                self._collect_diagnostics(out, diag)
+                # Clean reference pass.  A healthy codeword must produce a low syndrome;
+                # without these negatives the per-check AUROC has a single class and is
+                # undefined (a check watching 32/256 tokens fires on a 20%-corrupted
+                # frame with probability ~0.999).
+                clean_out = self.model(tpl_rgb_t.unsqueeze(0).to(self.device),
+                                       s_rgb.unsqueeze(0).to(self.device),
+                                       tpl_tir_t.unsqueeze(0).to(self.device),
+                                       s_tir.unsqueeze(0).to(self.device),
+                                       corruption=None)
+                diag["syndrome_clean"].append(
+                    clean_out["syndrome"].flatten(1)[0].float().cpu().numpy())
 
             px = cx + (box[0] - 0.5) * side
             py = cy + (box[1] - 0.5) * side
@@ -296,13 +339,55 @@ class Trainer:
             preds.append(prev.copy())
             gts.append(gt.copy())
 
-        return {"pred": np.asarray(preds), "gt": np.asarray(gts)}
+        result: Dict[str, Any] = {"pred": np.asarray(preds), "gt": np.asarray(gts)}
+        if collect:
+            result["diagnostics"] = diag
+        return result
+
+    @staticmethod
+    @torch.no_grad()
+    def _collect_diagnostics(out: Dict[str, torch.Tensor],
+                             diag: Dict[str, list]) -> None:
+        """Accumulate one frame of error-correction diagnostics.
+
+        Detection is scored against the labels implied by the *shared* incidence
+        (``1[(H @ M) > 0]``), so a random syndrome scores AUROC 0.5.
+        """
+        m_r = out["token_mask_rgb"][0].float()
+        m_t = out["token_mask_tir"][0].float()
+        mask_any = (m_r + m_t).clamp(max=1.0)
+
+        diag["syndrome"].append(out["syndrome"].flatten(1)[0].float().cpu().numpy())
+        diag["syndrome_y"].append(((out["H"] @ mask_any) > 0).float().cpu().numpy())
+        diag["locator"].append(out["locator_scattered"][0].float().cpu().numpy())
+        diag["locator_y"].append(mask_any.cpu().numpy())
+
+        if "clean_tokens" in out:
+            clean = out["clean_tokens"]
+            for mod in ("rgb", "tir"):
+                key = f"corrected_{mod}"
+                if key not in out:
+                    continue
+                ref = clean[mod][0].float()
+                after = (out[key][0].float() - ref).abs().mean(-1)
+                before = (out[f"corrupted_{mod}"][0].float() - ref).abs().mean(-1)
+                m = (m_r if mod == "rgb" else m_t)
+                diag["e_before"].append(before[m > 0.5].cpu().numpy())
+                diag["e_after"].append(after[m > 0.5].cpu().numpy())
+                diag["e_clean"].append(after[m < 0.5].cpu().numpy())
 
     @torch.no_grad()
     def evaluate(self, checkpoint: Optional[str] = None, subset: str = "testingset",
                  max_sequences: Optional[int] = None, max_frames: Optional[int] = None,
-                 root: Optional[str] = None) -> Dict[str, float]:
-        """Sequence-level PR / SR / NPR on LasHeR."""
+                 root: Optional[str] = None,
+                 corruption: Optional[Dict[str, Any]] = None,
+                 topk: int = 5) -> Dict[str, float]:
+        """Sequence-level PR / SR / NPR, plus the error-correction diagnostics.
+
+        With ``corruption`` set, the run also reports syndrome AUROC, localization
+        recall@k (against its chance level) and the masked recovery gain / damage --
+        the numbers that actually speak to the error-correction claim.
+        """
         if checkpoint:
             report = load_checkpoint(checkpoint, self.model, map_location=str(self.device))
             self.logger.info("loaded checkpoint %s (epoch %s)", checkpoint, report["epoch"])
@@ -315,9 +400,11 @@ class Trainer:
             seqs = seqs[:max_sequences]
 
         results = []
+        diags: list = []
         for i, seq in enumerate(seqs):
             try:
-                r = self.infer_sequence(data_root, subset, seq, max_frames=max_frames)
+                r = self.infer_sequence(data_root, subset, seq, max_frames=max_frames,
+                                        corruption=corruption, collect=bool(corruption))
             except Exception as exc:                                   # noqa: BLE001
                 self.logger.warning("skip %s: %s", seq, exc)
                 continue
@@ -328,6 +415,8 @@ class Trainer:
                 "pr": precision_at(r["pred"], r["gt"], 20.0),
                 "npr": normalized_precision(r["pred"], r["gt"], 0.2),
             })
+            if "diagnostics" in r:
+                diags.append(r["diagnostics"])
             if (i + 1) % 20 == 0:
                 self.logger.info("evaluated %d/%d sequences", i + 1, len(seqs))
 
@@ -335,4 +424,18 @@ class Trainer:
         self.logger.info("evaluation on %d sequences: PR %.2f | SR(AUC) %.2f | NPR %.2f",
                          len(results), summary.get("pr", 0) * 100,
                          summary.get("sr", 0) * 100, summary.get("npr", 0) * 100)
+
+        if diags:
+            merged = {k: [x for d in diags for x in d[k]] for k in diags[0]}
+            summary.update(summarize_detection(merged["syndrome"], merged["syndrome_y"],
+                                               merged["locator"], merged["locator_y"],
+                                               merged.get("syndrome_clean"), topk))
+            summary.update(summarize_recovery(merged["e_before"], merged["e_after"],
+                                              merged["e_clean"]))
+            self.logger.info(
+                "error-correction | syndrome AUROC %.3f | locator recall@%d %.3f "
+                "(chance %.3f) | recovery %.3f | damage %.4f",
+                summary["syndrome_auroc"], topk, summary[f"locator_recall_at_{topk}"],
+                summary[f"locator_chance_at_{topk}"], summary["recovery_gain"],
+                summary["damage_clean"])
         return summary

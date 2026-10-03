@@ -309,3 +309,49 @@ directly instead of only through the graph construction.
 The auxiliary `A_vv` semantic graph is retained but is no longer a parallel "check": it
 contributes an additive context term to the check representation, and the primary term is
 `obs_proj(H @ observation)`.
+
+### 11.8 Can the claim be checked? Yes -- `tools/diagnostics.py`
+
+`PR / SR / NPR` cannot distinguish "the correction worked" from "the tracker was robust
+anyway".  Two additions close that gap.
+
+**`codetrack/engine/evaluator.py`** adds the metrics that *do* speak to the claim:
+
+| metric | definition | chance level |
+|---|---|---|
+| `syndrome_auroc` | corrupted-frame syndrome vs. **clean-frame** syndrome (the clean pass is the negative class -- without it every check fires and the AUROC is undefined) | 0.5 |
+| `locator_recall_at_k` | corrupted tokens present in the top-k of `locator_scattered` | `k * n_pos / N`, reported alongside as `locator_chance_at_k` |
+| `recovery_gain` | `(E_before - E_after) / E_before`, **on corrupted tokens only** | 0 |
+| `damage_clean` | error on the untouched tokens, i.e. how much the repair disturbs healthy code | 0 |
+
+**`tools/diagnostics.py`** runs the perturbations that would expose decoration:
+
+| probe | what it breaks | a real ECC model should |
+|---|---|---|
+| `shuffle-incidence` | permutes the columns of `H` (which variable each check watches) | degrade sharply |
+| `shuffle-parity` | permutes the parity order | degrade |
+| `shuffle-syndrome` | permutes the syndrome entries | degrade |
+| `no-decoder` | bypasses the BP decoder entirely | tracking collapses, `recovery_gain` becomes exactly 0 |
+
+Run it with:
+
+```bash
+python tools/diagnostics.py --checkpoint outputs/<exp>/final.pth --sequences 5
+```
+
+The rule is simple and deliberately blunt: **a probe that does not hurt the metrics is
+decoration, not correction.**
+
+### 11.9 Architecture-property tests
+
+`tests/unit/test_architecture.py` locks one invariant per review finding -- identity-token
+permutation invariance (P0-6), a single row-normalised non-negative incidence (P0-1),
+minimum column degree (P1-4), `locator_scattered == s @ H` (P0-3), unit-interval gates
+(P1-6), independent per-modality corruption masks (P0-7), a parameter-matched MLP
+baseline, a removable FPN path (P0-4) and a fully frozen backbone.  They run on a 2-block
+dim-64 model, so the whole file finishes in seconds on CPU.
+
+> These tests earned their keep immediately: writing them surfaced three latent bugs that
+> the default configuration had been hiding -- `node_to_variable` had `128` hard-coded, the
+> minimum-degree repair indexed the wrong tensor dimension, and the MLP baseline still
+> carried the (now unused) BP message layers.

@@ -1,6 +1,3 @@
-"""`codetrack-eval` entry point."""
-
-
 """``codetrack-eval`` entry point."""
 
 from __future__ import annotations
@@ -24,6 +21,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root", default=None, help="dataset root override")
     p.add_argument("--device", default=None)
     p.add_argument("--override", action="append", default=[])
+    p.add_argument("--corrupt", action="store_true",
+                   help="evaluate under the corruption protocol and report the "
+                        "error-correction diagnostics (AUROC / recall / recovery)")
+    p.add_argument("--corrupt-token", default="tok_random_erase")
+    p.add_argument("--corrupt-ratio", type=float, default=0.2)
+    p.add_argument("--corrupt-severity", type=float, default=0.4)
+    p.add_argument("--corrupt-target", default="both", choices=["both", "rgb", "tir"])
+    p.add_argument("--topk", type=int, default=5)
     return p
 
 
@@ -36,13 +41,23 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    corruption = None
+    if args.corrupt:
+        corruption = {
+            "enabled": True,
+            "token": [args.corrupt_token],
+            "ratio": args.corrupt_ratio,
+            "severity": args.corrupt_severity,
+            "target": args.corrupt_target,
+        }
+
     trainer = Trainer(cfg, output_dir=out_dir)
     summary = trainer.evaluate(checkpoint=args.checkpoint, subset=args.subset,
                                max_sequences=args.max_sequences, max_frames=args.max_frames,
-                               root=args.root)
+                               root=args.root, corruption=corruption, topk=args.topk)
 
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
-    print(json.dumps({k: round(v * 100, 2) for k, v in summary.items()}, indent=2))
+    print(json.dumps({k: round(v, 4) for k, v in summary.items()}, indent=2))
 
 
 if __name__ == "__main__":

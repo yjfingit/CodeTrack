@@ -123,6 +123,5 @@ class TargetCandidateSelector(nn.Module):
 
         k = min(self.topk, n)
         _, index = torch.topk(priority, k=k, dim=1)                # B x k
-        variables = x_r.gather(1, index.unsqueeze(-1).expand(-1, -1, d))
         return {"scores_rgb": scores_rgb, "scores_tir": scores_tir,
-                "priority": priority, "index": index, "variables": variables}
+                "priority": priority, "index": index}

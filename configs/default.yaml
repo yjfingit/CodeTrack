@@ -26,6 +26,9 @@ model:
   num_graph_nodes: 128
   graph_top_k: 8
   bp_iterations: 2
+  # "bp" = neural belief propagation; "mlp" = parameter-matched residual denoiser
+  # with no message passing (the ablation that decides whether Tanner earns its keep)
+  decoder_mode: bp
   h_links_per_check: 32
   fpn_dim: 256
   # FPN taps come from before token corruption; the gate starts nearly closed.

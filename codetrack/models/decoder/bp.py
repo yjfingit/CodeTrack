@@ -29,12 +29,14 @@ class NeuralBPDecoder(nn.Module):
     def __init__(self, dim: int = 768, code_dim: int = 256, num_parity: int = 16,
                  num_variables: int = 256, iterations: int = 2,
                  links_per_check: int = 32, min_column_degree: int = 2,
+                 mode: str = "bp", mlp_hidden: int = 0,
                  generator: Optional[torch.Generator] = None):
         super().__init__()
         self.dim = dim
         self.iterations = iterations
         self.num_parity = num_parity
         self.num_variables = num_variables
+        self.mode = mode
 
         # ---- parity-check matrix H (16 x 256) with a fixed sparse support ----------
         support = torch.zeros(num_parity, num_variables)
@@ -45,27 +47,52 @@ class NeuralBPDecoder(nn.Module):
         # Guarantee a minimum column degree.  A variable watched by no check can never
         # receive a correction message, so its "repair" could only come from the local
         # update MLP -- which would silently turn the BP path into decoration.
+        # Attach to *free* rows, and loop, so the guarantee holds even when the random
+        # pattern is sparse relative to num_parity * min_column_degree.
         col_degree = support.sum(dim=0)
         for col in torch.nonzero(col_degree < min_column_degree, as_tuple=False).flatten():
-            need = int(min_column_degree - col_degree[col])
-            rows = torch.randperm(num_parity, generator=generator)[:need]
-            support[rows, col] = 1.0
+            while float(support[:, col].sum()) < min_column_degree:
+                free = torch.nonzero(support[:, col] == 0).flatten()
+                if free.numel() == 0:
+                    break
+                pick = int(torch.randint(free.numel(), (1,), generator=generator).item())
+                support[int(free[pick]), col] = 1.0
 
         self.register_buffer("H_support", support)
         self.H = nn.Parameter(support.clone() / links_per_check)
 
         # ---- message functions ---------------------------------------------------
-        self.v_msg = nn.Sequential(
-            nn.Linear(dim + 1, dim), nn.GELU(), nn.Linear(dim, dim),
-        )
-        self.parity_proj = nn.Linear(code_dim, dim)
-        self.c_msg = nn.Sequential(
-            nn.Linear(dim * 2 + 1, dim), nn.GELU(), nn.Linear(dim, dim),
-        )
-        self.update = nn.Sequential(
-            nn.Linear(dim * 2, dim), nn.GELU(), nn.Linear(dim, dim),
-        )
+        # In "mlp" mode none of these exist, otherwise they would be dead parameters and
+        # the baseline would not be parameter-matched.
+        if mode == "bp":
+            self.v_msg = nn.Sequential(
+                nn.Linear(dim + 1, dim), nn.GELU(), nn.Linear(dim, dim),
+            )
+            self.parity_proj = nn.Linear(code_dim, dim)
+            self.c_msg = nn.Sequential(
+                nn.Linear(dim * 2 + 1, dim), nn.GELU(), nn.Linear(dim, dim),
+            )
+            self.update = nn.Sequential(
+                nn.Linear(dim * 2, dim), nn.GELU(), nn.Linear(dim, dim),
+            )
+        else:
+            self.v_msg = self.parity_proj = self.c_msg = self.update = None
         self.out_norm = nn.LayerNorm(dim)
+
+        # ---- parameter-matched baseline -------------------------------------
+        # "mlp" removes message passing entirely and replaces each BP round with a
+        # residual MLP of matched width.  If this matches the BP decoder, the whole
+        # Tanner-graph story is decoration.
+        # One BP round costs roughly 2 * dim * (3 * dim) parameters; a two-layer MLP
+        # of the same input width costs 3 * hidden * dim, hence hidden ~ 2.7 * dim.
+        if mlp_hidden <= 0:
+            mlp_hidden = max(8, int(round(dim * 2048 / 768)))
+        self.mlp_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim + 1, mlp_hidden), nn.GELU(),   # input is [v, r]
+                nn.Linear(mlp_hidden, dim),
+            ) for _ in range(iterations)
+        ]) if mode == "mlp" else None
 
     # ------------------------------------------------------------------ helpers
     def _h(self) -> torch.Tensor:
@@ -104,17 +131,30 @@ class NeuralBPDecoder(nn.Module):
         the architecture figure.
         """
         b = variables_rgb.shape[0]
-        h = self._h()                                              # 16 x 256
-
         v = torch.cat([variables_rgb, variables_tir], dim=0)       # 2B x 256 x 768
         r = torch.cat([reliability_rgb, reliability_tir], dim=0).unsqueeze(-1)
+        total_delta = torch.zeros_like(v)
+
+        if self.mode == "mlp":
+            # no parity-check matrix, no messages: a matched residual denoiser
+            for block in self.mlp_blocks:
+                delta = block(torch.cat([v, r], dim=-1))
+                v = v + (1.0 - r) * delta
+                total_delta = total_delta + (1.0 - r) * delta
+            v = self.out_norm(v)
+            return {
+                "corrected_rgb": v[:b], "corrected_tir": v[b:],
+                "residual_rgb": total_delta[:b], "residual_tir": total_delta[b:],
+            }
+
+        # ---- belief propagation ---------------------------------------------------
+        h = self._h()                                              # M x N
         parity_c = parity.repeat(2, 1, 1) if parity.shape[0] == b else parity
         s = syndrome.repeat(2, 1, 1) if syndrome.shape[0] == b else syndrome
-        parity_ctx = self.parity_proj(parity_c)                    # 2B x 16 x 768
-        s_col = s.flatten(1).unsqueeze(-1)                         # 2B x 16 x 1
+        parity_ctx = self.parity_proj(parity_c)                    # 2B x M x dim
+        s_col = s.flatten(1).unsqueeze(-1)                         # 2B x M x 1
 
         m_cv = torch.zeros_like(v)
-        total_delta = torch.zeros_like(v)
 
         for _ in range(self.iterations):
             # ---- Variable -> Check ------------------------------------------------

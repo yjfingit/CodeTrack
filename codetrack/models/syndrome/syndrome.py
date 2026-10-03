@@ -73,7 +73,7 @@ class ErrorLocator(nn.Module):
         self.syndrome_to_node = nn.Sequential(
             nn.Linear(num_parity, hidden), nn.GELU(), nn.Linear(hidden, num_graph_nodes),
         )
-        self.node_to_variable = nn.Linear(128, num_variables)
+        self.node_to_variable = nn.Linear(num_graph_nodes, num_variables)
 
     def forward(self, syndrome: torch.Tensor, identity_map: torch.Tensor,
                 node_index: torch.Tensor, num_variables: int,

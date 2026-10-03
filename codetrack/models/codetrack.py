@@ -99,7 +99,8 @@ class CodeTrack(nn.Module):
                                        num_parity=self.num_parity,
                                        num_variables=self.num_variables,
                                        iterations=int(get("bp_iterations", 2)),
-                                       links_per_check=int(get("h_links_per_check", 32)))
+                                       links_per_check=int(get("h_links_per_check", 32)),
+                                       mode=str(get("decoder_mode", "bp")))
         self.fusion = CodeTrackFusion(dim=self.dim, fpn_dim=int(get("fpn_dim", 256)),
                                       head_dim=self.dim, grid=self.grid,
                                       taps=self.return_stages,
@@ -266,6 +267,11 @@ class CodeTrack(nn.Module):
         out["token_mask_rgb"] = mask_r
         out["token_mask_tir"] = mask_t
         out["token_mask"] = torch.clamp(mask_r + mask_t, max=1.0)   # union, diagnostics only
+        if corruption is not None:
+            # the corrupted view is kept so the evaluation can measure
+            # "error before correction" against the clean tokens
+            out["corrupted_rgb"] = x_r
+            out["corrupted_tir"] = x_t
 
         if clean_teacher:
             # The teacher is the *uncorrupted token set* -- running a second full
