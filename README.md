@@ -84,6 +84,14 @@ Datasets, weights and run outputs are excluded by design.
 Credentials are stored on the machine, never in the repository — see
 [docs/reproducibility.md](docs/reproducibility.md#git-credentials).
 
+On a fresh container the whole thing is restored with two commands (GitHub CLI lives on the data
+disk, so `gh` and its token both survive a container reset):
+
+```bash
+bash tools/install-gh.sh         # download gh, symlink it, persist GH_CONFIG_DIR
+bash tools/gh-login-device.sh    # device-code login -> open https://github.com/login/device
+```
+
 ---
 
 ## Installation
