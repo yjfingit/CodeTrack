@@ -102,7 +102,8 @@ class CodeTrack(nn.Module):
                                        links_per_check=int(get("h_links_per_check", 32)))
         self.fusion = CodeTrackFusion(dim=self.dim, fpn_dim=int(get("fpn_dim", 256)),
                                       head_dim=self.dim, grid=self.grid,
-                                      taps=self.return_stages)
+                                      taps=self.return_stages,
+                                      use_fpn=bool(get("use_fpn", True)))
         self.head = build_head({
             "type": get("head_type", "CENTER"),
             "inplanes": self.dim,
@@ -141,14 +142,23 @@ class CodeTrack(nn.Module):
         rel = self.reliability(x_r, x_t, identity, memory)
         sel = self.selector(x_r, x_t, identity)
 
-        graph = self.tanner(x_r, identity, parity, priority=sel["priority"])
-        syn = self.syndrome(graph["checks"], parity, graph["A_uv"])
+        # one incidence H for check aggregation, syndrome, localization and BP
+        H = self.decoder.matrix()
+        graph = self.tanner(x_r, identity, parity, priority=sel["priority"],
+                            variables_tir=x_t, H=H)
+        syn = self.syndrome(graph["checks"], parity)
         loc = self.locator(syn["syndrome"], graph["identity_map"],
-                           graph["node_index"], self.num_variables)
-        gate = self.gating(loc["severity"], graph["identity_map"])
+                           graph["node_index"], self.num_variables, H=H)
+
+        # reliability gathered onto the selected graph nodes, one vector per modality
+        idx = graph["node_index"]
+        gate_rgb, gate_tir = self.gating(loc["severity"],
+                                         rel["r_r"].gather(1, idx),
+                                         rel["r_t"].gather(1, idx))
 
         dec = self.decoder(x_r, x_t, parity, syn["syndrome"],
-                           rel["r_r"], rel["r_t"], gate=gate)
+                           rel["r_r"], rel["r_t"],
+                           gate_rgb=gate_rgb, gate_tir=gate_tir)
 
         fus = self.fusion(dec["corrected_rgb"], dec["corrected_tir"],
                           dec["residual_rgb"], dec["residual_tir"],
@@ -166,8 +176,11 @@ class CodeTrack(nn.Module):
             "reliability_rgb": rel["r_r"],
             "reliability_tir": rel["r_t"],
             "locator": loc["locator"],
+            "locator_scattered": loc["locator_scattered"],
             "severity": loc["severity"],
-            "gate": gate,
+            "gate_rgb": gate_rgb,
+            "gate_tir": gate_tir,
+            "H": H,
             "corrected_rgb": dec["corrected_rgb"],
             "corrected_tir": dec["corrected_tir"],
             "residual_rgb": dec["residual_rgb"],
@@ -178,19 +191,24 @@ class CodeTrack(nn.Module):
             "parity_tokens": parity,
             "fpn_rgb": fus["fpn_rgb"],
             "fpn_tir": fus["fpn_tir"],
+            "fpn_conf": fus["fpn_conf"],
         }
 
     def _maybe_corrupt(self, x_r: torch.Tensor, x_t: torch.Tensor,
                        corruption: Optional[Dict[str, Any]]):
-        """Apply token-level corruption and return ``(x_r, x_t, mask)``.
+        """Apply token-level corruption; returns ``(x_r, x_t, mask_rgb, mask_tir)``.
 
-        The mask (``B x N``, 1 = corrupted) is what supervises ``L_detect``.
+        The two masks are kept **separate** on purpose: supervising both reliabilities
+        with their union would force a healthy modality's reliability down whenever the
+        other one is damaged, which is exactly the opposite of "repair the bad modality
+        using the good one".
         """
         from ..data.corruption.corruption import corrupt_tokens
 
-        mask = torch.zeros(x_r.shape[:2], device=x_r.device)
+        mask_r = torch.zeros(x_r.shape[:2], device=x_r.device)
+        mask_t = torch.zeros(x_t.shape[:2], device=x_t.device)
         if not corruption or not corruption.get("enabled", True):
-            return x_r, x_t, mask
+            return x_r, x_t, mask_r, mask_t
 
         kinds = corruption.get("token") or corruption.get("kinds") or []
         if isinstance(kinds, str):
@@ -200,15 +218,20 @@ class CodeTrack(nn.Module):
 
         ratio = float(corruption.get("ratio", 0.2))
         severity = float(corruption.get("severity", 0.4))
-        both = bool(corruption.get("both_modalities", True))
+        # "rgb" / "tir" / "both" -- single-modality corruption is what exposes whether
+        # the tracker repairs the damaged modality using the healthy one
+        target = str(corruption.get("target", "both")).lower()
+        if not bool(corruption.get("both_modalities", True)):
+            target = "both" if target == "both" else target
 
         for kind in kinds:
-            x_r, m = corrupt_tokens(x_r, kind, ratio, severity)
-            mask = torch.clamp(mask + m, max=1.0)
-            if both:
+            if target in ("both", "rgb"):
+                x_r, m = corrupt_tokens(x_r, kind, ratio, severity)
+                mask_r = torch.clamp(mask_r + m, max=1.0)
+            if target in ("both", "tir"):
                 x_t, m2 = corrupt_tokens(x_t, kind, ratio, severity)
-                mask = torch.clamp(mask + m2, max=1.0)
-        return x_r, x_t, mask
+                mask_t = torch.clamp(mask_t + m2, max=1.0)
+        return x_r, x_t, mask_r, mask_t
 
     def forward(self, template_rgb: torch.Tensor, search_rgb: torch.Tensor,
                 template_tir: torch.Tensor, search_tir: torch.Tensor,
@@ -227,17 +250,16 @@ class CodeTrack(nn.Module):
         z_r, z_t = feats["z_r"], feats["z_t"]
         x_r_clean, x_t_clean = feats["x_r"], feats["x_t"]
 
-        x_r, x_t, token_mask = self._maybe_corrupt(x_r_clean, x_t_clean, corruption)
+        x_r, x_t, mask_r, mask_t = self._maybe_corrupt(x_r_clean, x_t_clean, corruption)
 
         out = self._code_path(z_r, x_r, z_t, x_t, feats, memory=memory)
-        out["token_mask"] = token_mask
+        out["token_mask_rgb"] = mask_r
+        out["token_mask_tir"] = mask_t
+        out["token_mask"] = torch.clamp(mask_r + mask_t, max=1.0)   # union, diagnostics only
 
         if clean_teacher:
+            # The teacher is the *uncorrupted token set* -- running a second full
+            # _code_path here would cost ~30% of the training step and nothing consumed
+            # its output, so the branch is intentionally kept to the backbone features.
             out["clean_tokens"] = {"rgb": x_r_clean.detach(), "tir": x_t_clean.detach()}
-            with torch.no_grad():
-                clean = self._code_path(z_r, x_r_clean, z_t, x_t_clean, feats, memory=memory)
-            out["clean"] = {k: clean[k] for k in
-                            ("feature_map", "corrected_rgb", "corrected_tir",
-                             "reliability_rgb", "reliability_tir", "syndrome",
-                             "bbox", "score_map_ctr", "size_map", "offset_map")}
         return out

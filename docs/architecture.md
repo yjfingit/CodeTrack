@@ -196,3 +196,84 @@ from `z_r: (1, 64, 768)` through `bbox: (1, 4)`.
 | fusion | 6.885 M |
 | head | 6.474 M |
 | **total** | **26.51 M trainable / 112.75 M** |
+
+---
+
+## 11. Single shared parity-check matrix (post-review revision)
+
+An external review of `b530d9a` found that the first implementation used **three
+unrelated connectivity structures** and therefore was not a Tanner decoder in any
+meaningful sense:
+
+| was | problem |
+|---|---|
+| `codebook`: `A : 16x16` (produced the parity) | unrelated to everything downstream |
+| `tanner`: `A_uv : 128x128` (variable-variable affinity) | not a parity-check matrix |
+| `decoder`: `H : 16x256` (random) | the only real incidence, used by BP alone |
+
+The syndrome, the error locator and the corruption labels were all computed against
+structures that the decoder never used.
+
+### 11.1 One `H` now drives the whole chain
+
+`H` lives in the decoder (`decoder.matrix()`, row-normalised, `softplus` so it stays in
+`R+`) and is passed explicitly to every stage:
+
+```text
+H (16 x 256)
+  |-- tanner : check_j = sum_i H[j,i] * v_i          (check nodes, B x 16 x 128)
+  |-- syndrome : s_j = D(phi(H v)_j, parity_j)       (visual syndrome, B x 1 x 16)
+  |-- loss : y_check = 1[(H @ M) > 0]                (supervision, per modality)
+  |-- locator : suspect_i = sum_j H[j,i] * s_j       (H^T, B x 256)
+  \-- decoder : m_vc = H v,  m_cv = H^T f_c(...)     (neural BP messages)
+```
+
+The check nodes used to be pooled from the 128 graph nodes by a learned slot matrix; they
+are now the actual parity checks over all 256 variables. The `128x128` affinity survives
+as `A_vv` -- an auxiliary *semantic* graph that only decides which tokens are worth
+watching. It is explicitly **not** called a parity-check matrix any more.
+
+### 11.2 Reliability gate that actually gates
+
+The decoder's `residual` was `sum(delta)` **without** the `(1 - r)` factor while the
+fusion added `corrected + residual`, so the full un-gated correction was pushed back into
+the tracking path even for fully reliable tokens. Now:
+
+* the fusion uses the corrected tokens only;
+* the reported residual is `sum((1 - r) * gate * delta)`;
+* the gate is computed from `severity` and the **per-modality** reliability gathered onto
+  the selected graph nodes, and RGB / TIR get separate gates.
+
+### 11.3 The FPN bypass is gated
+
+`block2` / `block5` taps are taken from the backbone, i.e. *before* token corruption.
+Added unconditionally they were a clean shortcut around the entire correction branch.
+A learnable `fpn_gate` (initialised with bias `-2`, so `sigmoid ~ 0.12`) now scales the
+FPN contribution, and `model.use_fpn: false` removes the path for the ablation.
+
+### 11.4 Per-modality corruption labels
+
+RGB and TIR masks are kept separate, so a healthy modality's reliability is not dragged
+down when the other one is damaged. `corruption.target: rgb | tir | both` selects which
+modality is damaged -- the setting needed for the "repair the bad modality with the good
+one" experiment.
+
+### 11.5 Masked correction
+
+`L_correct` is computed **only on corrupted positions**; a separate `L_preserve` term
+(also reported) keeps the decoder from disturbing the ~200 clean tokens. Averaging over all
+256 positions let the clean majority dilute the repair objective.
+
+### 11.6 Smaller fixes
+
+* `identity_tokens` now reads `q[:, -16:]` -- the 16 learnable queries, which are
+  *appended* after the 128 template tokens. The previous `q[:, :16]` returned template
+  tokens while the documentation described query outputs.
+* `H` guarantees `min_column_degree = 2`: previously 13.7% of variables (35 / 256) were
+  watched by no check at all and could only be "repaired" by the local update MLP.
+* The clean teacher no longer runs a second full `_code_path` (it was computed and never
+  used); this alone removed ~17% of the step time.
+* `identity_map` is a probability (`sigmoid`) rather than an unbounded logit.
+* The warm-up stage unfreezes the whole detect+repair chain, not just codebook+decoder --
+  otherwise the syndrome and locator stayed random while the loss asked them to localize.
+* `timm` is declared in `requirements.txt` / `pyproject.toml`.

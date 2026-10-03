@@ -117,27 +117,30 @@ class CodeTrackLoss(nn.Module):
         return F.softmax(sim / self.temperature, dim=-1)
 
     def _detect_loss(self, outputs: Dict[str, torch.Tensor],
-                     mask: torch.Tensor) -> torch.Tensor:
-        """Reliability + syndrome + localization supervision (fp32)."""
-        mask = mask.float()
-        target_reliable = (1.0 - mask).clamp(0.0, 1.0)
-        r_r = outputs["reliability_rgb"].float().clamp(1e-4, 1 - 1e-4)
-        r_t = outputs["reliability_tir"].float().clamp(1e-4, 1 - 1e-4)
-        reliability = (F.binary_cross_entropy(r_r, target_reliable)
-                       + F.binary_cross_entropy(r_t, target_reliable))
+                     mask_rgb: torch.Tensor, mask_tir: torch.Tensor) -> torch.Tensor:
+        """Reliability + syndrome + localization supervision (fp32).
 
-        # a check that watches a corrupted token must fire
-        b, n = mask.shape
-        per_check = n // max(self.num_parity, 1)
-        check_target = mask.view(b, self.num_parity, per_check).mean(dim=-1).clamp(0.0, 1.0)
+        The syndrome target is derived from the **shared parity-check matrix**: a check
+        must fire iff it actually watches at least one corrupted token.  RGB and TIR are
+        supervised with their own masks, so a healthy modality is not dragged down.
+        """
+        mask_rgb = mask_rgb.float()
+        mask_tir = mask_tir.float()
+        mask_any = torch.clamp(mask_rgb + mask_tir, max=1.0)
+
+        reliability = (
+            F.binary_cross_entropy(outputs["reliability_rgb"].float().clamp(1e-4, 1 - 1e-4),
+                                   (1.0 - mask_rgb).clamp(0.0, 1.0))
+            + F.binary_cross_entropy(outputs["reliability_tir"].float().clamp(1e-4, 1 - 1e-4),
+                                     (1.0 - mask_tir).clamp(0.0, 1.0)))
+
+        h = outputs["H"].float()                                    # M x N
+        check_target = ((h @ mask_any.t()) > 0).float().t()         # B x M
         syndrome = outputs["syndrome"].float().flatten(1).clamp(1e-4, 1 - 1e-4)
         syndrome_loss = F.binary_cross_entropy(syndrome, check_target)
 
-        # the locator is a per-token corruption probability (averaged over graph nodes).
-        # Kept as a bounded BCE: the earlier log-likelihood form exploded to ~1e3 and
-        # dominated the whole objective.
-        locator = outputs["locator"].float().mean(dim=1).clamp(1e-4, 1 - 1e-4)   # B x N
-        localize = F.binary_cross_entropy(locator, mask)
+        locator = outputs["locator_scattered"].float().clamp(1e-4, 1 - 1e-4)
+        localize = F.binary_cross_entropy(locator, mask_any)
 
         return reliability + syndrome_loss + localize
 
@@ -162,18 +165,31 @@ class CodeTrackLoss(nn.Module):
 
         # ---- L_detect ---------------------------------------------------------
         detect = torch.zeros((), device=device)
-        mask = outputs.get("token_mask")
-        if mask is not None and float(mask.sum()) > 0:
-            detect = self._detect_loss(outputs, mask.to(device))
+        mask_r = outputs.get("token_mask_rgb")
+        mask_t = outputs.get("token_mask_tir")
+        has_mask = mask_r is not None and mask_t is not None
+        if has_mask and float(mask_r.sum() + mask_t.sum()) > 0:
+            detect = self._detect_loss(outputs, mask_r.to(device), mask_t.to(device))
 
         # ---- L_correct / L_identity ------------------------------------------
         correct = torch.zeros((), device=device)
+        preserve = torch.zeros((), device=device)
         identity = torch.zeros((), device=device)
         clean = outputs.get("clean_tokens")
         if clean is not None:
             if self.lambda_correct > 0:
-                correct = (F.l1_loss(outputs["corrected_rgb"].float(), clean["rgb"].float())
-                           + F.l1_loss(outputs["corrected_tir"].float(), clean["tir"].float()))
+                # repair ONLY the corrupted positions -- averaging over all 256 lets the
+                # ~200 clean tokens dilute the "fix the broken one" objective
+                m_r = mask_r.to(device).float() if has_mask else torch.ones_like(correct)
+                m_t = mask_t.to(device).float() if has_mask else torch.ones_like(correct)
+                err_r = F.l1_loss(outputs["corrected_rgb"].float(), clean["rgb"].float(),
+                                  reduction="none").mean(-1)          # B x N
+                err_t = F.l1_loss(outputs["corrected_tir"].float(), clean["tir"].float(),
+                                  reduction="none").mean(-1)          # B x N
+                correct = ((err_r * m_r).sum() / m_r.sum().clamp(min=1.0)
+                           + (err_t * m_t).sum() / m_t.sum().clamp(min=1.0))
+                preserve = ((err_r * (1 - m_r)).sum() / (1 - m_r).sum().clamp(min=1.0)
+                            + (err_t * (1 - m_t)).sum() / (1 - m_t).sum().clamp(min=1.0))
             if self.lambda_identity > 0:
                 keys = F.normalize(self.identity_proj(outputs["identity_tokens"].float()), dim=-1)
                 with torch.no_grad():
@@ -183,7 +199,7 @@ class CodeTrackLoss(nn.Module):
 
         parts.update({"cls": cls.detach(), "l1": l1.detach(), "giou": giou.detach(),
                       "detect": detect.detach(), "correct": correct.detach(),
-                      "identity": identity.detach()})
+                      "preserve": preserve.detach(), "identity": identity.detach()})
 
         total = (track
                  + self.lambda_detect * detect

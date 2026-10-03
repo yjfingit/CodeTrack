@@ -74,28 +74,42 @@ class AdaptiveTannerGraph(nn.Module):
         self.slot_weight = nn.Parameter(torch.rand(num_parity, self.num_graph_nodes))
 
     def forward(self, variables: torch.Tensor, identity: torch.Tensor,
-                parity: torch.Tensor, priority: Optional[torch.Tensor] = None
+                parity: torch.Tensor, priority: Optional[torch.Tensor] = None,
+                variables_tir: Optional[torch.Tensor] = None,
+                H: Optional[torch.Tensor] = None
                 ) -> Dict[str, torch.Tensor]:
         """``variables``: ``B x 256 x 768``; ``identity``/``parity``: ``B x 16 x 256``.
 
-        ``priority`` (``B x 256``, from the target candidate selector) overrides the
+        ``H`` is the **shared parity-check matrix** ``M x N`` owned by the decoder.  When
+        given, the 16 check nodes are obtained by aggregating *all* variables through it,
+        which is what makes this a Tanner graph rather than three unrelated structures.
+
+        ``priority`` (``B x 256``, from the target candidate selector) is added to the
         internal identity score when choosing which nodes become graph nodes.
+        ``variables_tir`` makes the graph react to corruption in **either** modality.
         """
         b, n, d = variables.shape
 
         # ---- 1. top-k graph nodes + identity map -----------------------------------
-        id_score = self.identity_map(variables).squeeze(-1)            # B x 256
+        id_logits = self.identity_map(variables).squeeze(-1)            # B x 256
+        if variables_tir is not None:
+            id_logits = 0.5 * (id_logits + self.identity_map(variables_tir).squeeze(-1))
         if priority is not None:
-            id_score = id_score + priority
+            id_logits = id_logits + priority
         k = min(self.num_graph_nodes, n)
-        _, node_index = torch.topk(id_score, k=k, dim=1)               # B x k
-        nodes = variables.gather(1, node_index.unsqueeze(-1).expand(-1, -1, d))
+        _, node_index = torch.topk(id_logits, k=k, dim=1)               # B x k
+        gather_idx = node_index.unsqueeze(-1).expand(-1, -1, d)
+        nodes = variables.gather(1, gather_idx)
+        if variables_tir is not None:
+            nodes = 0.5 * (nodes + variables_tir.gather(1, gather_idx))
 
         node_feat = self.node_embed(nodes)                             # B x 128 x check_dim
-        identity_map = id_score.gather(1, node_index)                  # B x 128
+        # ranking uses the logit, but everything downstream treats this as a probability
+        identity_map = torch.sigmoid(id_logits.gather(1, node_index))   # B x 128, in (0,1)
 
-        # ---- 2. dynamic graph construction: A_uv = Softmax_s(U U^T / sqrt(d)) -------
-        # extend the codebook to graph-node resolution and add it as a structural prior
+        # ---- 2. variable-variable semantic affinity A_vv (NOT the parity-check graph) --
+        # Kept because it decides which tokens are worth watching, but the Tanner
+        # structure below is defined by H alone.
         code_prior = self.code_to_node(parity.mean(dim=1, keepdim=True))       # B x 1 x c
         code_prior = code_prior + self.code_to_node(identity.mean(dim=1, keepdim=True))
 
@@ -103,20 +117,26 @@ class AdaptiveTannerGraph(nn.Module):
         kk = self.k_proj(node_feat + code_prior)
         scale = (self.check_dim // self.heads) ** -0.5
         logits = (q @ kk.transpose(-2, -1)) * scale                    # B x 128 x 128
-        a_uv = sparsified_softmax(logits, self.top_k)                  # B x 128 x 128
+        a_vv = sparsified_softmax(logits, self.top_k)                   # B x 128 x 128
 
-        # ---- 3. check nodes: 16 parity checks, each embedded to 128 dims ------------
-        # each check aggregates its neighbourhood in the graph
-        agg = a_uv @ node_feat                                         # B x 128 x check_dim
-        # 16 learnable check slots pool the aggregated graph features
-        check_slots = self._check_slots(agg, b)                        # B x 16 x check_dim
+        # ---- 3. check nodes -------------------------------------------------------
+        # Aggregate the FULL variable set through the shared H, so that the syndrome is
+        # a genuine parity check over the same incidence the decoder uses.
+        if H is not None:
+            all_feat = self.node_embed(variables)                      # B x 256 x check_dim
+            if variables_tir is not None:
+                all_feat = 0.5 * (all_feat + self.node_embed(variables_tir))
+            check_slots = torch.einsum("mn,bnd->bmd", H, all_feat)     # B x 16 x check_dim
+        else:                                                          # legacy fallback
+            check_slots = self._check_slots(a_vv @ node_feat, b)
         checks = self.check_norm(check_slots + self.parity_to_check(parity))   # B x 16 x 128
 
         return {
-            "A_uv": a_uv,                    # B x 128 x 128
+            "A_uv": a_vv,                     # B x 128 x 128 (auxiliary semantic graph)
+            "A_vv": a_vv,
             "graph_nodes": node_feat,        # B x 128 x 128
             "node_index": node_index,        # B x 128
-            "identity_map": identity_map,    # B x 128
+            "identity_map": identity_map,    # B x 128, in (0,1)
             "checks": checks,                # B x 16 x 128
         }
 

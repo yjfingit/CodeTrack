@@ -14,7 +14,7 @@ token the checks that watch it light up.  Two capabilities follow from it:
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,9 +42,10 @@ class VisualSyndrome(nn.Module):
         self.sp1 = nn.Sequential(nn.Linear(num_parity, hidden), nn.GELU())
         self.sp2 = nn.Sequential(nn.Linear(hidden, num_parity), nn.Sigmoid())
 
-    def forward(self, checks: torch.Tensor, parity: torch.Tensor,
-                a_uv: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """``checks``: ``B x 16 x 128``; ``parity``: ``B x 16 x 256``, ``a_uv``: ``B x 128 x 128``."""
+    def forward(self, checks: torch.Tensor, parity: torch.Tensor
+                ) -> Dict[str, torch.Tensor]:
+        """``checks``: ``B x 16 x 128`` (already aggregated through ``H``);
+        ``parity``: ``B x 16 x 256``."""
         agg = self.phi(checks)                                    # B x 16 x 128
         ref = self.parity_ref(parity)                             # B x 16 x 128
 
@@ -75,9 +76,13 @@ class ErrorLocator(nn.Module):
         self.node_to_variable = nn.Linear(128, num_variables)
 
     def forward(self, syndrome: torch.Tensor, identity_map: torch.Tensor,
-                node_index: torch.Tensor, num_variables: int) -> Dict[str, torch.Tensor]:
-        """Returns ``locator`` ``B x 128 x 256`` and ``severity`` ``B x 128``."""
-        s = syndrome.flatten(1)                                   # B x 16
+                node_index: torch.Tensor, num_variables: int,
+                H: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """``locator`` is ``B x 128 x 256`` (per graph node -> per variable evidence),
+        ``locator_scattered`` is ``B x 256`` -- produced by pushing the syndrome back
+        through the **shared** ``H``, so "checks 2, 7 and 9 fired, and all of them watch
+        v17" is literally what the computation does.  ``severity`` is ``B x 128``."""
+        s = syndrome.flatten(1)                                   # B x M
         node_logits = self.syndrome_to_node(s)                    # B x 128
         variable_prior = self.node_to_variable(node_logits)       # B x 256
         # every graph node spreads its evidence over the variable nodes
@@ -86,21 +91,38 @@ class ErrorLocator(nn.Module):
         suspect = (1.0 - identity_map).unsqueeze(-1)              # B x 128 x 1
         locator = locator * suspect
         severity = (1.0 - identity_map) * torch.sigmoid(node_logits)   # B x 128
-        return {"locator": locator, "severity": severity,
-                "node_logits": node_logits}
+
+        if H is not None:
+            # H^T: each failing check votes for exactly the variables it watches
+            scattered = (s @ H).clamp(0.0, 1.0)                   # B x 256
+        else:
+            node_score = locator.max(dim=2).values                # B x 128
+            scattered = torch.zeros(locator.shape[0], num_variables,
+                                    device=locator.device, dtype=locator.dtype)
+            scattered.scatter_(1, node_index, node_score)
+        return {"locator": locator, "locator_scattered": scattered,
+                "severity": severity, "node_logits": node_logits}
 
 
 class ReliabilityAwareGating(nn.Module):
-    """Error severity -> per-node correction strength ``g in [0,1]``."""
+    """Error severity + **per-modality** reliability -> per-node correction strength.
+
+    Two gates are produced because RGB and TIR are repaired by the same Tanner graph
+    but have independent reliability estimates; sharing one gate would let a corrupted
+    modality be "corrected" as if it were healthy.
+    """
 
     def __init__(self, num_graph_nodes: int = 128, hidden: int = 64):
         super().__init__()
+        self.num_graph_nodes = num_graph_nodes
         self.mlp = nn.Sequential(
-            nn.Linear(num_graph_nodes * 2, hidden), nn.GELU(),
-            nn.Linear(hidden, num_graph_nodes), nn.Sigmoid(),
+            nn.Linear(num_graph_nodes * 3, hidden), nn.GELU(),
+            nn.Linear(hidden, num_graph_nodes * 2), nn.Sigmoid(),
         )
 
-    def forward(self, severity: torch.Tensor, reliability: torch.Tensor) -> torch.Tensor:
-        """``severity``: ``B x 128``, ``reliability``: ``B x 128`` -> gate ``B x 128``."""
-        x = torch.cat([severity, reliability], dim=-1)
-        return self.mlp(x)
+    def forward(self, severity: torch.Tensor, reliability_rgb: torch.Tensor,
+                reliability_tir: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``severity``/``reliability_*``: ``B x 128`` -> ``(gate_rgb, gate_tir)``."""
+        x = torch.cat([severity, reliability_rgb, reliability_tir], dim=-1)
+        out = self.mlp(x)
+        return out[..., :self.num_graph_nodes], out[..., self.num_graph_nodes:]

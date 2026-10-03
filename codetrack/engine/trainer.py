@@ -53,13 +53,6 @@ class Trainer:
         self.log_every = int(train_cfg.get("log_every", 10))
         self.amp = bool(train_cfg.get("amp", True)) and self.device.type == "cuda"
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.trainable_parameters(),
-            lr=float(train_cfg.get("lr", 1e-4)),
-            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-        )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
-
         loss_cfg = cfg.get("loss", {})
         self.loss_fn = CodeTrackLoss(
             cls_weight=float(loss_cfg.get("cls", 1.0)),
@@ -72,6 +65,14 @@ class Trainer:
             dim=self.model.dim,
             code_dim=self.model.code_dim,
         ).to(self.device)
+
+        # built after the loss module: the optimizer owns both parameter sets
+        self.optimizer = torch.optim.AdamW(
+            self._optim_parameters(),
+            lr=float(train_cfg.get("lr", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
+        )
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
 
         # ---- corruption + staged training schedule -----------------------------
         corr = dict(cfg.get("corruption", {}) or {})
@@ -104,12 +105,19 @@ class Trainer:
         keys = ("template_rgb", "search_rgb", "template_tir", "search_tir")
         return [batch[k].to(self.device, non_blocking=True) for k in keys]
 
+    def _optim_parameters(self):
+        """Trainable model parameters **plus** the loss module's own parameters.
+
+        The identity projection used by ``L_identity`` lives inside the loss module; if
+        it is not handed to the optimizer it silently stays at its random init.
+        """
+        return list(self.model.trainable_parameters()) + list(self.loss_fn.parameters())
+
     def set_trainable(self, modules: Optional[set] = None) -> None:
         """Freeze every CodeTrack block outside ``modules`` (``None`` = all of them).
 
-        The backbone keeps its own (frozen) state; only the CodeTrack additions that
-        hang off it remain as-is.  The optimizer is rebuilt afterwards because the
-        parameter set changed.
+        The backbone keeps its own (frozen) state.  The optimizer is rebuilt afterwards
+        because the parameter set changed.
         """
         for name, module in self.model.named_children():
             if name == "backbone":
@@ -119,7 +127,7 @@ class Trainer:
                 p.requires_grad = allow
         train_cfg = self.cfg.get("train", {})
         self.optimizer = torch.optim.AdamW(
-            self.model.trainable_parameters(),
+            self._optim_parameters(),
             lr=float(train_cfg.get("lr", 1e-4)),
             weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
         )
@@ -155,9 +163,14 @@ class Trainer:
             # then unfreeze everything for joint fine-tuning.
             stage = "codec" if epoch < self.warmup_epochs else "joint"
             if stage != self.stage:
-                self.set_trainable({"codebook", "decoder"} if stage == "codec" else None)
+                # warm up the whole detect+repair chain, not just the codebook and the
+                # decoder -- otherwise the syndrome and the locator stay random while the
+                # loss still asks them to localise corruption
+                warmup_modules = {"codebook", "reliability", "selector", "tanner",
+                                  "syndrome", "locator", "gating", "decoder"}
+                self.set_trainable(warmup_modules if stage == "codec" else None)
                 self.stage = stage
-                n_train = sum(p.numel() for p in self.model.trainable_parameters())
+                n_train = sum(p.numel() for p in self._optim_parameters())
                 self.logger.info("stage -> %s | trainable %.3f M", stage, n_train / 1e6)
 
             if hasattr(self.dataset, "seed"):

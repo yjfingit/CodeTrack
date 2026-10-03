@@ -28,6 +28,9 @@ model:
   bp_iterations: 2
   h_links_per_check: 32
   fpn_dim: 256
+  # FPN taps come from before token corruption; the gate starts nearly closed.
+  # Set to false for the no-FPN ablation.
+  use_fpn: true
   head_type: CENTER
   head_channel: 256
   discrepancy: learned
@@ -53,6 +56,8 @@ corruption:
   token: [tok_random_erase]
   ratio: 0.2
   severity: 0.4
+  # which modality gets the token corruption: both | rgb | tir
+  target: both
   cross_modal: false
   probability: 1.0
   both_modalities: true

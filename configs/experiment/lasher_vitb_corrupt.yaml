@@ -6,8 +6,13 @@ _base_: ../experiment/lasher_vitb.yaml
 
 corruption:
   enabled: true
-  level: token
+  level: mixed
+  # image-level degradation as well: without it the backbone taps stay perfectly clean
+  # and the FPN path becomes a shortcut that bypasses the whole correction branch
+  rgb: [rgb_lowlight, rgb_occl]
+  tir: [tir_crossover, tir_noise]
   token: [tok_random_erase]
   ratio: 0.2
   severity: 0.4
+  target: both
   both_modalities: true

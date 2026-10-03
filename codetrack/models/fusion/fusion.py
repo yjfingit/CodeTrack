@@ -32,11 +32,12 @@ class CodeTrackFusion(nn.Module):
     """Token residual fusion + FPN over backbone taps."""
 
     def __init__(self, dim: int = 768, fpn_dim: int = 256, head_dim: int = 768,
-                 grid: int = 16, taps: Tuple[int, ...] = (2, 5)):
+                 grid: int = 16, taps: Tuple[int, ...] = (2, 5), use_fpn: bool = True):
         super().__init__()
         self.dim = dim
         self.grid = grid
         self.taps = tuple(taps)
+        self.use_fpn = use_fpn
 
         self.tap_proj = nn.Linear(dim, fpn_dim)
 
@@ -50,6 +51,16 @@ class CodeTrackFusion(nn.Module):
             nn.BatchNorm2d(head_dim),
         )
         self.token_proj = nn.Conv2d(dim, head_dim, kernel_size=1, bias=False)
+
+        # ---- FPN bypass gate -------------------------------------------------
+        # The block-2 / block-5 taps are taken from the backbone, i.e. from *before*
+        # token corruption.  Added unconditionally they hand the tracker a clean
+        # shortcut and L_track can learn to ignore the whole correction branch.  The
+        # gate starts almost closed (bias -2 -> sigmoid ~0.12) and only opens if it
+        # actually helps; set ``use_fpn: false`` to remove the path entirely.
+        self.fpn_gate = nn.Conv2d(head_dim, 1, kernel_size=1)
+        nn.init.zeros_(self.fpn_gate.weight)
+        nn.init.constant_(self.fpn_gate.bias, -2.0)
 
     def _modality_fpn(self, taps: Dict[str, torch.Tensor]) -> torch.Tensor:
         """``{'block2': B x 320 x 768, ...}`` -> ``B x 512 x 16 x 16``."""
@@ -65,8 +76,11 @@ class CodeTrackFusion(nn.Module):
                 residual_rgb: torch.Tensor, residual_tir: torch.Tensor,
                 taps_r: Dict[str, torch.Tensor], taps_t: Dict[str, torch.Tensor]
                 ) -> Dict[str, torch.Tensor]:
-        # token-level fusion: corrected + residual, averaged over modalities
-        tokens = 0.5 * (corrected_rgb + corrected_tir) + 0.5 * (residual_rgb + residual_tir)
+        # Token-level fusion uses ONLY the corrected tokens.  The decoder's residual is
+        # already folded into them (``v <- v + (1-r) * gate * delta``), so adding
+        # ``residual`` a second time here would push the full, un-gated delta back into
+        # the tracking path and make the reliability gate a no-op.
+        tokens = 0.5 * (corrected_rgb + corrected_tir)
         feat_map = _tokens_to_map(tokens, self.grid)                      # B x 768 x 16 x 16
         token_map = self.token_proj(feat_map)
 
@@ -74,6 +88,10 @@ class CodeTrackFusion(nn.Module):
         fpn_t = self._modality_fpn(taps_t)
         fpn = self.fuse(torch.cat([fpn_r, fpn_t], dim=1))                 # B x 768 x 16 x 16
 
-        out = token_map + fpn
+        if not self.use_fpn:
+            out = token_map
+        else:
+            conf = torch.sigmoid(self.fpn_gate(token_map))               # B x 1 x 16 x 16
+            out = token_map + fpn * conf
         return {"feature_map": out, "fpn_rgb": fpn_r, "fpn_tir": fpn_t,
-                "token_map": token_map}
+                "token_map": token_map, "fpn_conf": conf if self.use_fpn else None}

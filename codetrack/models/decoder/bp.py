@@ -28,7 +28,8 @@ class NeuralBPDecoder(nn.Module):
 
     def __init__(self, dim: int = 768, code_dim: int = 256, num_parity: int = 16,
                  num_variables: int = 256, iterations: int = 2,
-                 links_per_check: int = 32, generator: Optional[torch.Generator] = None):
+                 links_per_check: int = 32, min_column_degree: int = 2,
+                 generator: Optional[torch.Generator] = None):
         super().__init__()
         self.dim = dim
         self.iterations = iterations
@@ -38,8 +39,18 @@ class NeuralBPDecoder(nn.Module):
         # ---- parity-check matrix H (16 x 256) with a fixed sparse support ----------
         support = torch.zeros(num_parity, num_variables)
         for row in range(num_parity):
-            idx = torch.randperm(num_variables, generator=generator)[:links_per_check]
-            support[row, idx] = 1.0
+            picked = torch.randperm(num_variables, generator=generator)[:links_per_check]
+            support[row, picked] = 1.0
+
+        # Guarantee a minimum column degree.  A variable watched by no check can never
+        # receive a correction message, so its "repair" could only come from the local
+        # update MLP -- which would silently turn the BP path into decoration.
+        col_degree = support.sum(dim=0)
+        for col in torch.nonzero(col_degree < min_column_degree, as_tuple=False).flatten():
+            need = int(min_column_degree - col_degree[col])
+            rows = torch.randperm(num_parity, generator=generator)[:need]
+            support[rows, col] = 1.0
+
         self.register_buffer("H_support", support)
         self.H = nn.Parameter(support.clone() / links_per_check)
 
@@ -58,17 +69,28 @@ class NeuralBPDecoder(nn.Module):
 
     # ------------------------------------------------------------------ helpers
     def _h(self) -> torch.Tensor:
-        h = self.H * self.H_support
+        # non-negative, row-normalised weights: softplus keeps A_ij in R+ as documented,
+        # whereas a raw Parameter can drift negative and explode when its row sum -> 0
+        h = F.softplus(self.H) * self.H_support
         return h / h.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
     def connectivity(self) -> torch.Tensor:
         return self.H_support
 
+    def matrix(self) -> torch.Tensor:
+        """The normalised parity-check matrix, ``M x N`` (16 x 256).
+
+        Exposed so that the syndrome target, the locator and any analysis code all use
+        the *same* incidence the decoder propagates messages over.
+        """
+        return self._h()
+
     # ------------------------------------------------------------------ forward
     def forward(self, variables_rgb: torch.Tensor, variables_tir: torch.Tensor,
                 parity: torch.Tensor, syndrome: torch.Tensor,
                 reliability_rgb: torch.Tensor, reliability_tir: torch.Tensor,
-                gate: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                gate_rgb: Optional[torch.Tensor] = None,
+                gate_tir: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Dual-modality message passing over one **shared** Tanner graph.
 
         ``variables_rgb`` / ``variables_tir``  ``B x 256 x 768``
@@ -106,13 +128,15 @@ class NeuralBPDecoder(nn.Module):
 
             # ---- Update: v <- v + (1 - r) * gate * delta ---------------------------
             delta = self.update(torch.cat([v, m_cv], dim=-1))      # 2B x 256 x 768
-            if gate is not None:
-                g = gate.repeat(2, 1) if gate.shape[0] == b else gate
+            if gate_rgb is not None or gate_tir is not None:
+                g_rgb = gate_rgb if gate_rgb is not None else torch.ones_like(reliability_rgb)
+                g_tir = gate_tir if gate_tir is not None else torch.ones_like(reliability_tir)
+                g = torch.cat([g_rgb, g_tir], dim=0) if g_rgb.shape[0] == b else g_rgb
                 g = F.interpolate(g.unsqueeze(1), size=v.shape[1], mode="linear",
                                   align_corners=False).transpose(1, 2)
                 delta = delta * g
             v = v + (1.0 - r) * delta
-            total_delta = total_delta + delta
+            total_delta = total_delta + (1.0 - r) * delta
 
         v = self.out_norm(v)
         return {

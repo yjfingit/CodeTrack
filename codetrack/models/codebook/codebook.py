@@ -66,7 +66,9 @@ class SparseParityGenerator(nn.Module):
 
     def forward(self, identity: torch.Tensor) -> torch.Tensor:
         """``identity``: ``B x K x d`` -> ``B x M x d``."""
-        a = self.A * self.support
+        # non-negative weights (as documented: A_ij in [0, 1]) -- a raw Parameter
+        # divided by its row sum can go negative and blow up when the sum hits zero
+        a = F.softplus(self.A) * self.support
         a = a / a.sum(dim=1, keepdim=True).clamp(min=1e-6)
         return a @ identity
 
@@ -127,7 +129,7 @@ class TargetCodebookEncoder(nn.Module):
         q = self.proj(q)                                 # B x 144 x 768  (Query)
         q = self.codebook_block(q)                       # B x 144 x 768
 
-        identity = self.ecc_identity(q[:, :self.num_identity])   # B x 16 x 256
+        identity = self.ecc_identity(q[:, -self.num_identity:])   # B x 16 x 256
         parity = self.parity_generator(identity)                 # B x 16 x 256
         return identity, self.norm(parity), q
 
