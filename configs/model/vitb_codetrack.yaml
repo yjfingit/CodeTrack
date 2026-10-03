@@ -1,0 +1,15 @@
+_base_: ../default.yaml
+
+model:
+  backbone: vitb_shared
+  img_size: 256
+  template_size: 128
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  num_identity_tokens: 16
+  num_parity_tokens: 16
+  num_variable_nodes: 256
+  bp_iterations: 2
+  uep: false

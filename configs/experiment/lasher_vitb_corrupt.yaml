@@ -1,0 +1,7 @@
+# Robustness experiment: same model evaluated under the corruption protocol.
+_base_: ../experiment/lasher_vitb.yaml
+
+corruption:
+  enabled: true
+  level: mixed
+  protocol: configs/corruption

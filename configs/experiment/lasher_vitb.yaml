@@ -1,0 +1,16 @@
+# Main experiment: CodeTrack ViT-B/16 on LasHeR.
+_base_: ../default.yaml
+
+data:
+  dataset: lasher
+  root: data/LasHeR
+  batch_size: 8
+  num_workers: 4
+
+train:
+  epochs: 10
+  samples_per_epoch: 131072
+  batch_size: 8
+
+eval:
+  metrics: [pr, sr, npr]

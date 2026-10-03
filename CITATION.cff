@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use CodeTrack in your research, please cite the following."
+title: "CodeTrack: Structured Redundancy and Syndrome-Guided Correction for Robust RGB-T Tracking"
+abstract: >-
+  CodeTrack formulates RGB-T single object tracking from an error-correction perspective, treating
+  modality degradation as structured corruption of multimodal target representations. A learnable
+  target codebook supplies identity and sparse parity tokens, a reliability-adaptive Tanner graph
+  yields a visual syndrome map, and a neural belief-propagation decoder localizes and repairs
+  corrupted tokens iteratively.
+authors:
+  - family-names: "TODO"
+    given-names: "TODO"
+version: 0.1.0
+date-released: "2026-10-03"
+license: MIT
+repository-code: "TODO"
+keywords:
+  - rgb-t tracking
+  - single object tracking
+  - error correction
+  - tanner graph
+  - multimodal

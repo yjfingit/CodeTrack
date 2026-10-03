@@ -1,0 +1,52 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.Python
+.ipynb_checkpoints/
+
+# --- tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# --- data (mount, never commit) ---
+data/
+!data/.gitkeep
+*.zip
+*.tar
+*.tar.gz
+
+# --- model weights & run artifacts ---
+checkpoints/
+!checkpoints/.gitkeep
+outputs/
+!outputs/.gitkeep
+wandb/
+runs/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# --- logs ---
+*.log
+logs/
+
+# --- editor / os ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- local overrides ---
+.env
+*.local.yaml

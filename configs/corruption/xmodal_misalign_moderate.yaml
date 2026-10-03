@@ -1,0 +1,8 @@
+# Cross-modal spatial misalignment, moderate setting.
+corruption:
+  enabled: true
+  level: cross_modal
+  type: xmodal_shift
+  ratio: 0.2
+  severity: 0.2
+  seed: 0

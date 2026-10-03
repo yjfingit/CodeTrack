@@ -1,0 +1,44 @@
+# CodeTrack base configuration. Experiment configs inherit from this file via `_base_`.
+seed: 0
+device: cuda
+
+model:
+  name: codetrack
+  backbone: vitb_shared
+  pretrained: false
+  img_size: 256
+  template_size: 128
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  num_identity_tokens: 16
+  num_parity_tokens: 16
+  num_variable_nodes: 256
+  bp_iterations: 2
+  uep: false
+
+data:
+  dataset: lasher
+  root: data/LasHeR
+  num_workers: 4
+  batch_size: 8
+
+corruption:
+  enabled: false
+
+train:
+  epochs: 10
+  samples_per_epoch: 131072
+  lr: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+
+loss:
+  lambda_corr: 1.0
+  lambda_syn: 1.0
+  lambda_parity: 0.1
+
+eval:
+  metrics: [pr, sr, npr]

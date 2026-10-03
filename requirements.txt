@@ -1,0 +1,10 @@
+# runtime dependencies (mirrors [project].dependencies in pyproject.toml)
+torch>=2.1
+torchvision>=0.16
+numpy>=1.24
+opencv-python>=4.8
+pyyaml>=6.0
+tqdm>=4.66
+einops>=0.7
+scipy>=1.11
+tensorboard>=2.15

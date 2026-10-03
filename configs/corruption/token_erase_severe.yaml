@@ -1,0 +1,8 @@
+# Token-level random erasure, severe setting. See docs/corruption_protocol.md.
+corruption:
+  enabled: true
+  level: token
+  type: tok_random_erase
+  ratio: 0.4
+  severity: 0.4
+  seed: 0
