@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from ..data.datasets import build_dataset
 from ..data.corruption.corruption import CorruptionConfig, apply_image_corruption
 from ..metrics import normalized_precision, precision_at, success_auc, summarize
-from .evaluator import summarize_detection, summarize_recovery
+from .evaluator import summarize_detection, summarize_recovery, summarize_hinge
 from ..models.codetrack import CodeTrack
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
 from ..utils.logging import get_logger
@@ -253,14 +253,15 @@ class Trainer:
                     self.logger.info(
                         "[%s] it %d | loss %.4f | track %.4f (cls %.3f l1 %.3f giou %.3f) "
                         "| detect %.4f (rel %.3f syn %.3f loc %.3f) "
-                        "| correct %.4f (gain %.4f preserve %.4f) | identity %.4f "
-                        "| %.2fs/it | %.0f MiB",
+                        "| correct %.4f (gain %.4f act %.2f p95 %.3f pres %.4f) "
+                        "| identity %.4f | %.2fs/it | %.0f MiB",
                         stage, step, losses["loss"].item(), losses["track"].item(),
                         losses["cls"].item(), losses["l1"].item(), losses["giou"].item(),
                         losses["detect"].item(), losses["detect_reliability"].item(),
                         losses["detect_syndrome"].item(), losses["detect_localize"].item(),
                         losses["correct"].item(), losses["gain"].item(),
-                        losses["preserve"].item(),
+                        losses["gain_active_fraction"].item(),
+                        losses["e_ratio_p95"].item(), losses["preserve"].item(),
                         losses["identity"].item(), (time.time() - t_start) / step, mem)
 
                 if max_iters and step >= max_iters:
@@ -347,7 +348,8 @@ class Trainer:
 
         diag = {"syndrome": [], "syndrome_y": [], "syndrome_density": [], "syndrome_clean": [],
                 "locator": [], "locator_y": [],
-                "e_before": [], "e_after": [], "e_clean": []}
+                "e_before": [], "e_after": [], "e_clean": [],
+                "rec_e_before": [], "rec_e_after": [], "rec_hinge": [], "rec_active": []}
 
         for f in range(n):
             gt = annos[f]
@@ -440,6 +442,16 @@ class Trainer:
                 diag["e_after"].append(after[m > 0.5].cpu().numpy())
                 diag["e_clean"].append(after[m < 0.5].cpu().numpy())
 
+        # The authoritative recovery numbers: computed by the SAME helper training uses, so
+        # "L_gain = 0.0000" and "recovery_gain = -0.7" cannot both be true.  The per-modality
+        # arrays above are kept for the damage breakdown, where per-modality granularity is
+        # what you actually want; this block is for the pass/fail question.
+        rec = self.loss_fn.masked_recovery(out)
+        diag["rec_e_before"].append(float(rec["e_before"][0]))
+        diag["rec_e_after"].append(float(rec["e_after"][0]))
+        diag["rec_hinge"].append(float(rec["hinge"][0]))
+        diag["rec_active"].append(float(rec["active"][0]))
+
     @torch.no_grad()
     def evaluate(self, checkpoint: Optional[str] = None, subset: str = "testingset",
                  max_sequences: Optional[int] = None, max_frames: Optional[int] = None,
@@ -497,6 +509,10 @@ class Trainer:
                                                merged.get("syndrome_density"), topk=topk))
             summary.update(summarize_recovery(merged["e_before"], merged["e_after"],
                                               merged["e_clean"]))
+            if merged.get("rec_hinge"):
+                summary.update(summarize_hinge(merged["rec_e_before"], merged["rec_e_after"],
+                                                merged["rec_hinge"], merged["rec_active"],
+                                                self.loss_fn.gain_beta))
             self.logger.info(
                 "error-correction | syndrome AUROC %.3f | density rho %.3f (mae %.3f) "
                 "| locator P@%d %.3f (chance %.3f) | recovery %.3f | damage %.4f",

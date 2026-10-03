@@ -43,11 +43,30 @@ import torch.nn.functional as F
 
 
 class VisualSyndrome(nn.Module):
-    """``s_j = D(phi({v_i : i in N(j)}), p_j)`` and its learned aggregation."""
+    """``s_j = D(phi({v_i : i in N(j)}), p_j)`` and its learned aggregation.
+
+    ``use_obs_energy`` is **off by default and must stay off for any result that is meant
+    to show the Tanner structure works.**  Under zero-erasure the per-check observation
+    energy correlates with the corruption density at r = 1.0000 -- not because the check
+    structure helps, but because erasing a token sets it to exactly zero, so "the
+    neighbourhood's energy collapsed" *is* the label.  A syndrome head reading it never has
+    to learn any check/variable consistency, which is precisely the claim under test.
+
+    Stop-gradient would not fix this: it blocks the gradient, not the numerical leakage.
+    The energy feature stays available for the decoder, which legitimately may use an
+    observation-quality cue, but the syndrome head does not see it.
+
+    As the review notes, the leak is specific to zero-erasure.  Under energy-preserving
+    replacement noise the mean energy is roughly invariant to the corruption ratio (corr
+    should fall towards 0); under additive noise the expected energy *rises* with the
+    corrupted fraction.  So ``tools/syndrome_fit.py --ratio`` must be reported per
+    corruption type, and the headline "syndrome is informative" number has to come from a
+    run without this path.
+    """
 
     def __init__(self, dim: int = 768, check_dim: int = 128, num_parity: int = 16,
                  hidden: int = 128, discrepancy: str = "learned", code_dim: int = 256,
-                 density_prior: float = 0.2):
+                 density_prior: float = 0.2, use_obs_energy: bool = False):
         super().__init__()
         self.num_parity = num_parity
         self.discrepancy = discrepancy
@@ -73,10 +92,11 @@ class VisualSyndrome(nn.Module):
         self.residual_mlp = nn.Sequential(
             nn.Linear(check_dim, hidden), nn.GELU(), nn.Linear(hidden, 1),
         )
-        # gain on the observation-energy read-out.  Starts at 1.0 because that term is the
-        # one measurement that provably carries the answer (corr = 1.000 with the density);
-        # the network can zero it if it turns out to be useless, but it should not have to
-        # discover it from a 0.13 signal-to-noise ratio.
+        # Observation-energy read-out.  Kept as an *optional* input, default OFF: under
+        # zero-erasure it is a label proxy (corr 1.000 with the density), so any result that
+        # uses it cannot claim the Tanner structure is what produced the syndrome.  See the
+        # class docstring.  ``tools/diagnostics.py --probe no-obs-energy`` ablates it.
+        self.use_obs_energy = bool(use_obs_energy)
         self.energy_gain = nn.Parameter(torch.tensor(1.0))
         self.d = nn.Sequential(
             nn.Linear(check_dim, hidden), nn.GELU(), nn.Linear(hidden, 1),
@@ -118,12 +138,11 @@ class VisualSyndrome(nn.Module):
             s = mean_sq                                             # plain L2, as before
 
         # The magnitude path.  Erasure zeroes a token, so ``mean_i ||x_i||^2`` over a check's
-        # neighbourhood IS the density (measured corr = 1.000).  ``checks`` cannot carry it:
-        # it is LayerNorm-ed, which fixes the per-element scale, and the corruption only
-        # moves it ~13% relative -- against that noise the head provably collapsed to a
-        # constant (soft-BCE 0.6932 == ln 2, worse than a constant-mean predictor's 0.6534).
-        # Feeding the raw energy bypasses the normalisation that was erasing the evidence.
-        if obs_energy is not None:
+        # neighbourhood IS the density (measured corr = 1.000) -- which is exactly why it is
+        # off by default: see the class docstring.  ``checks`` cannot carry the signal
+        # either, because it is LayerNorm-ed and the corruption only moves it ~13% relative,
+        # which is why the syndrome collapsed to a constant before these fixes.
+        if obs_energy is not None and self.use_obs_energy:
             s = s + self.energy_gain * obs_energy.float()
         if residual is not None:
             res = residual.float()

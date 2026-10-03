@@ -50,3 +50,4 @@ Thumbs.db
 # --- local overrides ---
 .env
 *.local.yaml
+outputs/

@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 __all__ = ["auroc", "spearman", "recall_at_k", "precision_at_k", "chance_level",
-           "summarize_detection", "summarize_recovery"]
+           "summarize_detection", "summarize_recovery", "summarize_hinge"]
 
 
 def auroc(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -219,6 +219,40 @@ def summarize_detection(syndrome_scores: Sequence[np.ndarray],
                 out["syndrome_density_auroc"] = auroc(sc, hard)
             else:
                 out["syndrome_density_auroc"] = float("nan")
+    return out
+
+
+def summarize_hinge(e_before: Sequence[float], e_after: Sequence[float],
+                    hinge: Sequence[float], active: Sequence[float],
+                    beta: float = 0.9) -> Dict[str, float]:
+    """Hinge diagnostics for ``L_gain``, from the *same* helper the loss uses.
+
+    The review's objection is right: a hinge that prints as ``0.0000`` after rounding may be
+    inactive everywhere or active on half the frames, and those call for opposite decisions
+    about whether the term still constrains anything.  So report
+
+    * ``hinge_mean`` / ``hinge_p95`` -- the violation magnitude,
+    * ``active_fraction`` -- how often ``e_after > beta * e_before`` at all,
+    * ``e_after_over_before`` -- the recovery ratio itself; < 1 means the decoder helps.
+
+    ``recovery_gain`` from :func:`summarize_recovery` is kept alongside; if the two disagree
+    the definitions are still drifting and that has to be fixed before the term is judged.
+    """
+    b = np.asarray(list(e_before), dtype=np.float64)
+    a = np.asarray(list(e_after), dtype=np.float64)
+    h = np.asarray(list(hinge), dtype=np.float64)
+    act = np.asarray(list(active), dtype=np.float64)
+    out = {
+        "hinge_mean": float(h.mean()) if h.size else float("nan"),
+        "hinge_p95": float(np.quantile(h, 0.95)) if h.size else float("nan"),
+        "gain_active_fraction": float(act.mean()) if act.size else float("nan"),
+        "e_before_mean": float(b.mean()) if b.size else float("nan"),
+        "e_after_mean": float(a.mean()) if a.size else float("nan"),
+        "e_after_over_before": float(a.mean() / b.mean()) if b.size and b.mean() > 0 else float("nan"),
+        "e_ratio_median": float(np.median(a / np.maximum(b, 1e-8))) if a.size else float("nan"),
+        "e_ratio_p95": float(np.quantile(a / np.maximum(b, 1e-8), 0.95)) if a.size else float("nan"),
+        "hinge_beta": float(beta),
+    }
     return out
 
 

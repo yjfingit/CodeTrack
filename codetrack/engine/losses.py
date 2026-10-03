@@ -188,6 +188,48 @@ class CodeTrackLoss(nn.Module):
                          + self.w_syndrome * syndrome_loss
                          + self.w_localize * localize)}
 
+    def masked_recovery(self, outputs: Dict[str, torch.Tensor]
+                        ) -> Dict[str, torch.Tensor]:
+        """``e_before`` / ``e_after`` / the hinge, computed exactly as training does.
+
+        The review is right that "L_gain reads 0.0000" and "recovery_gain is -0.7" cannot
+        both be true unless the two paths disagree.  Rather than compare a training mean
+        against an evaluation aggregate, the evaluation now calls *this* function and the
+        two are the same code path by construction.
+
+        Returns per-sample scalars so the caller can report a distribution, not just a
+        mean: a hinge that is zero *on average* can still be active on half the batch, and a
+        rounded ``0.0000`` hides that completely.
+        """
+        clean = outputs.get("clean_tokens")
+        mask_r = outputs.get("token_mask_rgb")
+        mask_t = outputs.get("token_mask_tir")
+        zero = torch.zeros((), device=outputs["corrected_rgb"].device)
+        if clean is None or mask_r is None or mask_t is None or mask_r.sum() + mask_t.sum() == 0:
+            return {"e_before": zero, "e_after": zero, "hinge": zero,
+                    "ratio": zero, "active": zero}
+
+        m_r, m_t = mask_r.float(), mask_t.float()
+        clean_r, clean_t = clean["rgb"].float(), clean["tir"].float()
+        err_r = F.l1_loss(outputs["corrected_rgb"].float(), clean_r, reduction="none").mean(-1)
+        err_t = F.l1_loss(outputs["corrected_tir"].float(), clean_t, reduction="none").mean(-1)
+
+        e_after = ((err_r * m_r).sum() / m_r.sum().clamp(min=1.0)
+                   + (err_t * m_t).sum() / m_t.sum().clamp(min=1.0))
+        if outputs.get("corrupted_rgb") is None:
+            return {"e_before": zero, "e_after": e_after, "hinge": zero,
+                    "ratio": zero, "active": zero}
+
+        pre_r = F.l1_loss(outputs["corrupted_rgb"].float(), clean_r, reduction="none").mean(-1)
+        pre_t = F.l1_loss(outputs["corrupted_tir"].float(), clean_t, reduction="none").mean(-1)
+        e_before = ((pre_r * m_r).sum() / m_r.sum().clamp(min=1.0)
+                    + (pre_t * m_t).sum() / m_t.sum().clamp(min=1.0))
+
+        hinge = torch.clamp(e_after - self.gain_beta * e_before, min=0.0)
+        return {"e_before": e_before, "e_after": e_after, "hinge": hinge,
+                "ratio": e_after / e_before.clamp(min=1e-8),
+                "active": (hinge > 0).float()}
+
     # ------------------------------------------------------------------ forward
     def forward(self, outputs: Dict[str, torch.Tensor],
                 target_box: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
@@ -234,6 +276,7 @@ class CodeTrackLoss(nn.Module):
         preserve = torch.zeros((), device=device)
         gain = torch.zeros((), device=device)
         identity = torch.zeros((), device=device)
+        rec = None
         clean = outputs.get("clean_tokens")
         if clean is not None:
             m_r = mask_r.to(device).float() if has_mask else None
@@ -256,29 +299,35 @@ class CodeTrackLoss(nn.Module):
                 preserve = ((err_r * (1 - m_r)).sum() / (1 - m_r).sum().clamp(min=1.0)
                             + (err_t * (1 - m_t)).sum() / (1 - m_t).sum().clamp(min=1.0))
             if self.lambda_gain > 0 and m_r is not None:
-                # Relative "must beat the input" margin.  Absolute L1 to the clean
-                # teacher is minimised by *any* small delta, including doing nothing
-                # useful; L_gain compares the error AFTER correction against the error
-                # BEFORE it (the corrupted input) and only bites when the decoder fails
-                # to be better than simply passing its own input through.
-                e_before = 0.0
-                e_after = 0.0
-                if outputs.get("corrupted_rgb") is not None:
-                    pre_r = F.l1_loss(outputs["corrupted_rgb"].float(), clean["rgb"].float(),
-                                      reduction="none").mean(-1)
-                    pre_t = F.l1_loss(outputs["corrupted_tir"].float(), clean["tir"].float(),
-                                      reduction="none").mean(-1)
-                    e_before = ((pre_r * m_r).sum() / m_r.sum().clamp(min=1.0)
-                                + (pre_t * m_t).sum() / m_t.sum().clamp(min=1.0))
-                    e_after = ((err_r * m_r).sum() / m_r.sum().clamp(min=1.0)
-                               + (err_t * m_t).sum() / m_t.sum().clamp(min=1.0))
-                gain = torch.clamp(e_after - self.gain_beta * e_before, min=0.0)
+                # Relative "must beat the input" margin, via the SAME helper the evaluation
+                # path calls -- a hinge that reads 0.0000 here and a negative recovery_gain
+                # there cannot both be right, and duplicating the definition is how they
+                # drifted apart in the first place.
+                rec = self.masked_recovery(outputs)
+                gain = rec["hinge"].mean()
             if self.lambda_identity > 0:
                 keys = F.normalize(self.identity_proj(outputs["identity_tokens"].float()), dim=-1)
                 with torch.no_grad():
                     target_dist = self._identity_dist(clean["rgb"].float(), keys)
                 pred_dist = self._identity_dist(outputs["corrected_rgb"].float(), keys)
                 identity = -(target_dist * torch.log(pred_dist.clamp(min=1e-8))).sum(-1).mean()
+
+        # Distribution, not just the mean.  A hinge averaging to 0.0000 says nothing about
+        # whether it is inactive on every sample or active on half of them, and the review's
+        # point is precisely that the rounded number hides the difference.
+        rec_stats = {
+            "e_before": torch.zeros((), device=device),
+            "e_after": torch.zeros((), device=device),
+            "gain_active_fraction": torch.zeros((), device=device),
+            "e_ratio_p95": torch.zeros((), device=device),
+        }
+        if rec is not None and rec["e_before"].numel() > 1:
+            rec_stats = {
+                "e_before": rec["e_before"].mean().detach(),
+                "e_after": rec["e_after"].mean().detach(),
+                "gain_active_fraction": rec["active"].mean().detach(),
+                "e_ratio_p95": torch.quantile(rec["ratio"].detach().float(), 0.95),
+            }
 
         parts.update({"cls": cls.detach(), "l1": l1.detach(), "giou": giou.detach(),
                       "detect": detect.detach(),
@@ -287,7 +336,7 @@ class CodeTrackLoss(nn.Module):
                       "detect_localize": det_parts["localize"],
                       "correct": correct.detach(),
                       "preserve": preserve.detach(), "gain": gain.detach(),
-                      "identity": identity.detach()})
+                      "identity": identity.detach(), **rec_stats})
 
         total = (track
                  + self.lambda_detect * detect

@@ -45,6 +45,12 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--ratio", type=float, default=0.2)
     ap.add_argument("--severity", type=float, default=0.4)
+    ap.add_argument("--token", default="tok_random_erase",
+                    help="corruption to MEASURE with; should match what the checkpoint was "
+                         "trained on, since the energy statistics differ per type and a "
+                         "zero-erase measurement of a noise-trained model is meaningless")
+    ap.add_argument("--energy", action="store_true",
+                    help="set model.syndrome_use_obs_energy=true (must match training)")
     ap.add_argument("--out", default="outputs/syndrome_fit.json")
     ap.add_argument("--override", action="append", default=[],
                     help="config override key.sub=value, must match the checkpoint's shape")
@@ -52,7 +58,10 @@ def main() -> int:
 
     # The checkpoint fixes the architecture (M, N, degree); the default config would build
     # a differently-shaped model and load_state_dict would fail with an opaque message.
-    cfg = load_config(args.config, args.override)
+    override = list(args.override)
+    if args.energy:
+        override.append("model.syndrome_use_obs_energy=true")
+    cfg = load_config(args.config, override)
     trainer = Trainer(cfg, output_dir=Path(args.out).parent / "synfit")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["model"]
     missing, unexpected = trainer.model.load_state_dict(state, strict=False)
@@ -88,7 +97,7 @@ def main() -> int:
                                 device=trainer.device)
 
             out_a = model(tpl, srh, tpl_t, srh_t, corruption={
-                "enabled": True, "token": ["tok_random_erase"],
+                "enabled": True, "token": [args.token],
                 "ratio": args.ratio, "severity": args.severity, "target": "both"})
 
             # the label: density over the SAME support the model used

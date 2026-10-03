@@ -42,6 +42,10 @@ model:
   # corruption mask (see CodeTrack._apply_tap_corruption): a clean bypass would let
   # L_track ignore the correction branch entirely.
   use_fpn: true
+  # The per-check observation energy is a label proxy under zero-erasure (corr 1.000 with
+  # the corruption density), so the syndrome head does NOT see it by default.  Any result
+  # claiming the Tanner structure produced the syndrome must be measured with this false.
+  syndrome_use_obs_energy: false
   head_type: CENTER
   head_channel: 256
   discrepancy: learned

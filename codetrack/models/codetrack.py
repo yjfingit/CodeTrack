@@ -91,9 +91,15 @@ class CodeTrack(nn.Module):
             check_dim=self.check_dim, top_k=int(get("graph_top_k", 8)),
             code_dim=self.code_dim,
         )
-        self.syndrome = VisualSyndrome(check_dim=self.check_dim, num_parity=self.num_parity,
-                                       code_dim=self.code_dim,
-                                       discrepancy=str(get("discrepancy", "learned")))
+        # ``syndrome_use_obs_energy`` is OFF by default.  Under zero-erasure the per-check
+        # observation energy correlates with the corruption density at r = 1.0000 -- the
+        # label leaks through it -- so any claim that "the Tanner structure produced the
+        # syndrome" has to be made on a run without it.  See VisualSyndrome's docstring.
+        self.syndrome = VisualSyndrome(
+            check_dim=self.check_dim, num_parity=self.num_parity, code_dim=self.code_dim,
+            discrepancy=str(get("discrepancy", "learned")),
+            density_prior=float(get("corruption_ratio", 0.2)),
+            use_obs_energy=bool(get("syndrome_use_obs_energy", False)))
         self.locator = ErrorLocator(num_parity=self.num_parity,
                                     num_variables=self.num_variables,
                                     num_graph_nodes=self.num_graph_nodes)
