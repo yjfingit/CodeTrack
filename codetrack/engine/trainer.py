@@ -81,6 +81,7 @@ class Trainer:
         self.use_corruption = bool(corr.get("enabled", False))
         self.use_clean_teacher = bool(loss_cfg.get("clean_teacher", self.use_corruption))
         self.warmup_epochs = int(train_cfg.get("codec_warmup_epochs", 0))
+        self.grad_diag_every = int(train_cfg.get("grad_diag_every", 0))
         self.stage = ""
 
         self.dataset = None
@@ -146,6 +147,40 @@ class Trainer:
             "both_modalities": bool(c.get("both_modalities", True)),
         }
 
+    @torch.enable_grad()
+    def _gradient_conflict(self, inputs, target, corruption) -> Optional[Dict[str, float]]:
+        """Cosine between the tracking and the correction gradients.
+
+        ``L_correct`` pulls the features back towards the clean codeword while ``L_track``
+        only needs the box to be right; if the two gradients are consistently opposed the
+        correction branch is being fought by the tracking objective rather than helped.
+        Measured on the blocks the two losses actually share.
+        """
+        watched = ("decoder", "codebook", "reliability")
+        params = [p for n, p in self.model.named_parameters()
+                  if p.requires_grad and n.split(".")[0] in watched]
+        if not params:
+            return None
+
+        def grads(loss_key: str) -> Optional[torch.Tensor]:
+            out = self.model(*inputs, corruption=corruption, clean_teacher=True)
+            parts = self.loss_fn(out, target)
+            loss = parts.get(f"{loss_key}_graph", parts[loss_key])
+            if not torch.isfinite(loss):
+                return None
+            g = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            flat = [x.reshape(-1) for x in g if x is not None]
+            return torch.cat(flat) if flat else None
+
+        g_track = grads("track")
+        g_correct = grads("correct")
+        if g_track is None or g_correct is None:
+            return None
+        cos = torch.nn.functional.cosine_similarity(g_track, g_correct, dim=0)
+        return {"grad_cos_track_correct": float(cos),
+                "grad_norm_track": float(g_track.norm()),
+                "grad_norm_correct": float(g_correct.norm())}
+
     # ------------------------------------------------------------------- train
     def train(self, max_iters: Optional[int] = None) -> Dict[str, Any]:
         if self.loader is None:
@@ -198,6 +233,14 @@ class Trainer:
                 self.scaler.update()
 
                 step += 1
+                if self.grad_diag_every and step % self.grad_diag_every == 0:
+                    diag = self._gradient_conflict(inputs, target, corruption)
+                    if diag:
+                        self.logger.info(
+                            "[grad] cos(L_track, L_correct) = %+.3f | |g_track| %.3f "
+                            "| |g_correct| %.3f",
+                            diag["grad_cos_track_correct"], diag["grad_norm_track"],
+                            diag["grad_norm_correct"])
                 if step % self.log_every == 0 or step == 1:
                     mem = (torch.cuda.max_memory_allocated() / 2**20
                            if self.device.type == "cuda" else 0)

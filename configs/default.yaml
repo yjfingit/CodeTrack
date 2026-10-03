@@ -75,6 +75,8 @@ train:
   log_every: 10
   # stage 1: train codebook + BP decoder only for N epochs, then joint fine-tuning
   codec_warmup_epochs: 1
+  # every N steps, report cos(L_track, L_correct) on the shared blocks (0 = off)
+  grad_diag_every: 0
 
 loss:
   # L = L_track + 1.0 * L_detect + 2.0 * L_correct + 0.1 * L_identity

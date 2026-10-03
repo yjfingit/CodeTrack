@@ -207,4 +207,7 @@ class CodeTrackLoss(nn.Module):
                  + self.lambda_identity * identity)
         parts["track"] = track.detach()
         parts["loss"] = total
+        # graph-connected copies, used only by the gradient-conflict diagnostic
+        parts["track_graph"] = track
+        parts["correct_graph"] = correct
         return parts
