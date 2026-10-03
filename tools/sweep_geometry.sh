@@ -18,7 +18,7 @@ set -u
 PY=/root/autodl-tmp/lab/envs/gola/bin/python
 CFG=configs/experiment/lasher_vitb_corrupt.yaml
 STEPS=3000
-COMMON="--max-iters $STEPS --override train.num_workers=2 --override train.log_every=500 \
+COMMON="--max-iters $STEPS --override train.num_workers=2 --override train.log_every=200 \
         --override train.codec_warmup_epochs=0 --override model.h_links_per_check=24"
 
 run () {  # name  extra...

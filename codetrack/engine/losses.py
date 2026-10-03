@@ -310,7 +310,12 @@ class CodeTrackLoss(nn.Module):
         identity = torch.zeros((), device=device)
         rec = None
         clean = outputs.get("clean_tokens")
-        if clean is not None:
+        # decoder_mode="off" makes corrected_* literally the (grad-free) input, so every
+        # correction term is a constant with no grad_fn.  Including it makes the total loss a
+        # tensor that requires_grad=False and backward() raises -- which is why the "no
+        # decoder" arms crashed instead of running.  The terms are meaningless there anyway.
+        correction_suppressed = outputs.get("decoder_off", False)
+        if clean is not None and not correction_suppressed:
             m_r = mask_r.to(device).float() if has_mask else None
             m_t = mask_t.to(device).float() if has_mask else None
             if self.lambda_correct > 0 or self.lambda_preserve > 0 or self.lambda_gain > 0:

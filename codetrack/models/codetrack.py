@@ -232,6 +232,8 @@ class CodeTrack(nn.Module):
             "residual_tir": dec["residual_tir"],
             "norm_only_rgb": dec.get("norm_only_rgb"),
             "norm_only_tir": dec.get("norm_only_tir"),
+            # lets the loss skip terms that have no gradient path in decoder_mode="off"
+            "decoder_off": self.decoder.mode == "off",
             "A_uv": graph["A_uv"],
             "identity_map": graph["identity_map"],
             "identity_tokens": identity,

@@ -174,9 +174,19 @@ class Trainer:
             loss = parts.get(f"{loss_key}_graph", parts[loss_key])
             if not torch.isfinite(loss):
                 return None
+            # In decoder_mode="off" the correction terms are constants with no grad_fn (the
+            # "corrected" tokens are literally the input), and torch.autograd.grad raises on
+            # them.  isfinite() alone does not catch it.  The conflict diagnostic is
+            # meaningless for that arm anyway -- there is no correction gradient to conflict.
+            if not loss.requires_grad:
+                return None
             g = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
             flat = [x.reshape(-1) for x in g if x is not None]
             return torch.cat(flat) if flat else None
+
+        if self.model.decoder.mode == "off":
+            # no correction path exists, so there is no conflict to report
+            return None
 
         g_track = grads("track")
         g_correct = grads("correct")
