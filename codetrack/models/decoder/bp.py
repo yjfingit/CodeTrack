@@ -225,10 +225,16 @@ class NeuralBPDecoder(nn.Module):
             v = v + (1.0 - r) * delta
             total_delta = total_delta + (1.0 - r) * delta
 
+        # norm-only control: the decoder's output LayerNorm applied to the *uncorrected*
+        # input.  It isolates the pure scale change from the message updates, so a negative
+        # recovery_gain can be attributed (or not) to the Tanner messages.
+        norm_only = self.out_norm(torch.cat([variables_rgb, variables_tir], dim=0))
         v = self.out_norm(v)
         return {
             "corrected_rgb": v[:b],
             "corrected_tir": v[b:],
             "residual_rgb": total_delta[:b],
             "residual_tir": total_delta[b:],
+            "norm_only_rgb": norm_only[:b],
+            "norm_only_tir": norm_only[b:],
         }

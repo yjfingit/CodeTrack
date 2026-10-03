@@ -214,21 +214,44 @@ class CodeTrackLoss(nn.Module):
         err_r = F.l1_loss(outputs["corrected_rgb"].float(), clean_r, reduction="none").mean(-1)
         err_t = F.l1_loss(outputs["corrected_tir"].float(), clean_t, reduction="none").mean(-1)
 
-        e_after = ((err_r * m_r).sum() / m_r.sum().clamp(min=1.0)
-                   + (err_t * m_t).sum() / m_t.sum().clamp(min=1.0))
+        # PER SAMPLE.  The dim argument is not optional: without it ``(err_r * m_r).sum()``
+        # collapses the whole batch into one scalar, so every "distribution" statistic
+        # computed downstream (active fraction, p95) silently reads 0 because a scalar has
+        # numel() == 1.  That is exactly the bug that made a dead hinge look measured.
+        n_r = m_r.sum(dim=1).clamp(min=1.0)                           # B
+        n_t = m_t.sum(dim=1).clamp(min=1.0)                           # B
+        e_after = ((err_r * m_r).sum(dim=1) / n_r
+                   + (err_t * m_t).sum(dim=1) / n_t)                 # B
         if outputs.get("corrupted_rgb") is None:
-            return {"e_before": zero, "e_after": e_after, "hinge": zero,
-                    "ratio": zero, "active": zero}
+            z = torch.zeros_like(e_after)
+            return {"e_before": z, "e_after": e_after, "hinge": z,
+                    "ratio": z, "active": z}
 
         pre_r = F.l1_loss(outputs["corrupted_rgb"].float(), clean_r, reduction="none").mean(-1)
         pre_t = F.l1_loss(outputs["corrupted_tir"].float(), clean_t, reduction="none").mean(-1)
-        e_before = ((pre_r * m_r).sum() / m_r.sum().clamp(min=1.0)
-                    + (pre_t * m_t).sum() / m_t.sum().clamp(min=1.0))
+        e_before = ((pre_r * m_r).sum(dim=1) / n_r
+                    + (pre_t * m_t).sum(dim=1) / n_t)                 # B
 
         hinge = torch.clamp(e_after - self.gain_beta * e_before, min=0.0)
-        return {"e_before": e_before, "e_after": e_after, "hinge": hinge,
-                "ratio": e_after / e_before.clamp(min=1e-8),
-                "active": (hinge > 0).float()}
+        out = {"e_before": e_before, "e_after": e_after, "hinge": hinge,
+               "ratio": e_after / e_before.clamp(min=1e-8),
+               "active": (hinge > 0).float()}
+
+        # The decoder ends in a learnable LayerNorm (``out_norm``) that neither the corrupted
+        # input nor the clean teacher has passed through.  So part of ``e_after`` is a pure
+        # scale change, not message passing.  ``tools/recovery_probe.py`` reports the norm-only
+        # baseline that separates the two; without it a negative recovery_gain cannot be
+        # attributed to the message updates.
+        if outputs.get("norm_only_rgb") is not None:
+            n_r_only = F.l1_loss(outputs["norm_only_rgb"].float(), clean_r,
+                                 reduction="none").mean(-1)
+            n_t_only = F.l1_loss(outputs["norm_only_tir"].float(), clean_t,
+                                 reduction="none").mean(-1)
+            e_norm = ((n_r_only * m_r).sum(dim=1) / n_r
+                      + (n_t_only * m_t).sum(dim=1) / n_t)
+            out["e_norm_only"] = e_norm
+            out["ratio_norm_only"] = e_norm / e_before.clamp(min=1e-8)
+        return out
 
     # ------------------------------------------------------------------ forward
     def forward(self, outputs: Dict[str, torch.Tensor],
@@ -305,6 +328,12 @@ class CodeTrackLoss(nn.Module):
                 # drifted apart in the first place.
                 rec = self.masked_recovery(outputs)
                 gain = rec["hinge"].mean()
+            elif m_r is not None:
+                # The term is OFF, but the statistics are still needed: an ablation that
+                # switches L_gain off must still be able to report whether the constraint
+                # was satisfied, otherwise "hinge reads 0.0000" is just the default value of
+                # a variable nobody wrote to.
+                rec = self.masked_recovery(outputs)
             if self.lambda_identity > 0:
                 keys = F.normalize(self.identity_proj(outputs["identity_tokens"].float()), dim=-1)
                 with torch.no_grad():
@@ -315,18 +344,26 @@ class CodeTrackLoss(nn.Module):
         # Distribution, not just the mean.  A hinge averaging to 0.0000 says nothing about
         # whether it is inactive on every sample or active on half of them, and the review's
         # point is precisely that the rounded number hides the difference.
+        # Distribution, not just the mean.  A hinge averaging to 0.0000 says nothing about
+        # whether it is inactive on every sample or active on half of them.  Note this used
+        # to be guarded by ``numel() > 1``, which was always false because
+        # ``masked_recovery`` collapsed the batch into a scalar -- so every field below was
+        # the hard-coded default and looked like a measurement.
         rec_stats = {
             "e_before": torch.zeros((), device=device),
             "e_after": torch.zeros((), device=device),
             "gain_active_fraction": torch.zeros((), device=device),
+            "e_ratio_median": torch.zeros((), device=device),
             "e_ratio_p95": torch.zeros((), device=device),
         }
-        if rec is not None and rec["e_before"].numel() > 1:
+        if rec is not None and rec["e_before"].numel() > 0:
+            ratio = rec["ratio"].detach().float()
             rec_stats = {
                 "e_before": rec["e_before"].mean().detach(),
                 "e_after": rec["e_after"].mean().detach(),
                 "gain_active_fraction": rec["active"].mean().detach(),
-                "e_ratio_p95": torch.quantile(rec["ratio"].detach().float(), 0.95),
+                "e_ratio_median": ratio.median(),
+                "e_ratio_p95": torch.quantile(ratio, 0.95),
             }
 
         parts.update({"cls": cls.detach(), "l1": l1.detach(), "giou": giou.detach(),

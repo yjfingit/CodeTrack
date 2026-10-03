@@ -42,14 +42,20 @@ from codetrack.utils.config import load_config  # noqa: E402
 def shuffled_incidence(model, seed: int = 0) -> Iterator[None]:
     """Permute which variable each check watches (permute the columns of H)."""
     dec = model.decoder
-    original = dec.H_support
+    original_support = dec.H_support
+    original_weight = dec.H.data
     g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(original.shape[1], generator=g)
-    dec.H_support = original[:, perm].contiguous()
+    perm = torch.randperm(original_support.shape[1], generator=g)
+    # The learned weights must follow the support.  Permuting only ``H_support`` leaves
+    # ``self.H`` carrying the weights of the *original* columns, so the decoder aggregates
+    # exactly as before and the probe silently measures nothing.
+    dec.H_support = original_support[:, perm].contiguous()
+    dec.H.data = original_weight[:, perm].contiguous()
     try:
         yield
     finally:
-        dec.H_support = original
+        dec.H_support = original_support
+        dec.H.data = original_weight
 
 
 @contextmanager
@@ -58,8 +64,10 @@ def shuffled_parity(model, seed: int = 0) -> Iterator[None]:
     cb = model.codebook
     original = cb.parity_from_incidence
 
-    def patched(identity, variables, H):
-        p = original(identity, variables, H)
+    # ``parity_from_incidence`` gained a ``reliability`` argument; the probe must forward
+    # whatever it receives or the call raises TypeError and the run looks broken, not ablated.
+    def patched(identity, variables, H, reliability=None):
+        p = original(identity, variables, H, reliability=reliability)
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(p.shape[1], generator=g).to(p.device)
         return p[:, perm]
@@ -77,8 +85,9 @@ def shuffled_syndrome(model, seed: int = 0) -> Iterator[None]:
     syn = model.syndrome
     original = syn.forward
 
-    def patched(checks, parity):
-        out = original(checks, parity)
+    # ``VisualSyndrome.forward`` takes ``residual`` and ``obs_energy`` now.
+    def patched(checks, parity, residual=None, obs_energy=None):
+        out = original(checks, parity, residual=residual, obs_energy=obs_energy)
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(out["syndrome"].shape[-1], generator=g).to(out["syndrome"].device)
         out = dict(out)
@@ -125,15 +134,21 @@ PROBES = {
 def run_probe(trainer: Trainer, checkpoint: Optional[str], probe: str,
               corruption: Dict[str, Any], max_sequences: int, max_frames: int,
               topk: int) -> Dict[str, float]:
+    """Evaluate one probe.
+
+    The checkpoint is loaded for **every** probe, not just the baseline.  It used to be
+    passed only for the baseline, so the perturbed probes evaluated a *randomly initialised*
+    model: their numbers described the initialisation, not the effect of the perturbation.
+    A shuffle probe that shows "no change" under those conditions means nothing at all --
+    which is exactly how a broken ablation can look like a clean negative result.
+    """
     context = PROBES[probe]
     if context is None:
-        metrics = trainer.evaluate(checkpoint=checkpoint, max_sequences=max_sequences,
-                                  max_frames=max_frames, corruption=corruption, topk=topk)
-    else:
-        with context(trainer.model):
-            metrics = trainer.evaluate(checkpoint=None, max_sequences=max_sequences,
-                                      max_frames=max_frames, corruption=corruption, topk=topk)
-    return metrics
+        return trainer.evaluate(checkpoint=checkpoint, max_sequences=max_sequences,
+                                max_frames=max_frames, corruption=corruption, topk=topk)
+    with context(trainer.model):
+        return trainer.evaluate(checkpoint=checkpoint, max_sequences=max_sequences,
+                                max_frames=max_frames, corruption=corruption, topk=topk)
 
 
 def main() -> int:
@@ -146,6 +161,11 @@ def main() -> int:
     parser.add_argument("--ratio", type=float, default=0.2)
     parser.add_argument("--severity", type=float, default=0.4)
     parser.add_argument("--target", default="both", choices=["both", "rgb", "tir"])
+    parser.add_argument("--token", default="tok_burst_erase",
+                        help="token corruption to probe with; MUST match what the checkpoint "
+                             "was trained on. Random erasure is the negative control (the "
+                             "syndrome carries no information there), burst is the setting "
+                             "the locality prior is built for.")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--probe", default="all",
                         help="comma separated probes, or 'all'")
@@ -158,7 +178,7 @@ def main() -> int:
 
     corruption = {
         "enabled": True,
-        "token": ["tok_random_erase"],
+        "token": [args.token],
         "ratio": args.ratio,
         "severity": args.severity,
         "target": args.target,

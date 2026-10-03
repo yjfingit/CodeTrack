@@ -400,9 +400,8 @@ class Trainer:
             result["diagnostics"] = diag
         return result
 
-    @staticmethod
     @torch.no_grad()
-    def _collect_diagnostics(out: Dict[str, torch.Tensor],
+    def _collect_diagnostics(self, out: Dict[str, torch.Tensor],
                              diag: Dict[str, list]) -> None:
         """Accumulate one frame of error-correction diagnostics.
 
@@ -446,11 +445,15 @@ class Trainer:
         # "L_gain = 0.0000" and "recovery_gain = -0.7" cannot both be true.  The per-modality
         # arrays above are kept for the damage breakdown, where per-modality granularity is
         # what you actually want; this block is for the pass/fail question.
+        #
+        # Inference runs batch 1, so these are single-element tensors.  ``.mean()`` rather
+        # than ``[0]``: indexing a 0-d tensor raises, and that used to be swallowed by
+        # evaluate()'s except-and-skip, which would have turned a crash into "N/A".
         rec = self.loss_fn.masked_recovery(out)
-        diag["rec_e_before"].append(float(rec["e_before"][0]))
-        diag["rec_e_after"].append(float(rec["e_after"][0]))
-        diag["rec_hinge"].append(float(rec["hinge"][0]))
-        diag["rec_active"].append(float(rec["active"][0]))
+        diag["rec_e_before"].append(float(rec["e_before"].mean()))
+        diag["rec_e_after"].append(float(rec["e_after"].mean()))
+        diag["rec_hinge"].append(float(rec["hinge"].mean()))
+        diag["rec_active"].append(float(rec["active"].mean()))
 
     @torch.no_grad()
     def evaluate(self, checkpoint: Optional[str] = None, subset: str = "testingset",
@@ -477,14 +480,17 @@ class Trainer:
 
         results = []
         diags: list = []
+        skipped: List[str] = []
         for i, seq in enumerate(seqs):
             try:
                 r = self.infer_sequence(data_root, subset, seq, max_frames=max_frames,
                                         corruption=corruption, collect=bool(corruption))
             except Exception as exc:                                   # noqa: BLE001
                 self.logger.warning("skip %s: %s", seq, exc)
+                skipped.append(f"{seq}: {exc}")
                 continue
             if len(r["pred"]) == 0:
+                skipped.append(f"{seq}: empty prediction")
                 continue
             results.append({
                 "sr": success_auc(r["pred"], r["gt"]),
@@ -497,9 +503,19 @@ class Trainer:
                 self.logger.info("evaluated %d/%d sequences", i + 1, len(seqs))
 
         summary = summarize(results)
+        # A silently shortened evaluation is worse than a failed one: metrics computed over
+        # half the set look fine and mean nothing.  The valid count is reported explicitly and
+        # a large skip rate is surfaced rather than left in the log.
+        summary["n_sequences"] = len(results)
+        summary["n_requested"] = len(seqs)
+        summary["n_skipped"] = len(skipped)
         self.logger.info("evaluation on %d sequences: PR %.2f | SR(AUC) %.2f | NPR %.2f",
                          len(results), summary.get("pr", 0) * 100,
                          summary.get("sr", 0) * 100, summary.get("npr", 0) * 100)
+        if skipped:
+            self.logger.warning("%d/%d sequences skipped -- metrics are over the valid "
+                                "subset only; first few: %s",
+                                len(skipped), len(seqs), skipped[:3])
 
         if diags:
             merged = {k: [x for d in diags for x in d[k]] for k in diags[0]}
@@ -510,9 +526,19 @@ class Trainer:
             summary.update(summarize_recovery(merged["e_before"], merged["e_after"],
                                               merged["e_clean"]))
             if merged.get("rec_hinge"):
+                # The per-modality arrays above average every corrupted token of both
+                # modalities together; the helper normalises each modality by its own
+                # corrupted-token count and then adds.  With different corruption counts per
+                # modality the two weightings differ, which is why the headline number was
+                # computed from a different estimator than the one training logs.  Both are
+                # reported, and ``recovery_gain`` now comes from the helper.
                 summary.update(summarize_hinge(merged["rec_e_before"], merged["rec_e_after"],
                                                 merged["rec_hinge"], merged["rec_active"],
                                                 self.loss_fn.gain_beta))
+                eb = float(np.mean(merged["rec_e_before"])) if merged["rec_e_before"] else 0.0
+                ea = float(np.mean(merged["rec_e_after"])) if merged["rec_e_after"] else 0.0
+                summary["recovery_gain_unpooled"] = summary.get("recovery_gain")
+                summary["recovery_gain"] = (1.0 - ea / eb) if eb > 0 else float("nan")
             self.logger.info(
                 "error-correction | syndrome AUROC %.3f | density rho %.3f (mae %.3f) "
                 "| locator P@%d %.3f (chance %.3f) | recovery %.3f | damage %.4f",
