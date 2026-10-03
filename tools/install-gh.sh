@@ -33,7 +33,7 @@ ln -sf "${GH_BIN}" "${LINK_DIR}/gh"
 echo "[3/4] persistent config dir -> ${GH_CONFIG_DIR}"
 mkdir -p "${GH_CONFIG_DIR}"
 
-echo "[4/4] shell wiring (GH_CONFIG_DIR + PATH)"
+echo "[4/5] shell wiring (GH_CONFIG_DIR + PATH)"
 if ! grep -q "GH_CONFIG_DIR.*lab/tools/gh" /root/.bashrc 2>/dev/null; then
   {
     echo ""
@@ -46,6 +46,14 @@ if ! grep -q "GH_CONFIG_DIR.*lab/tools/gh" /root/.bashrc 2>/dev/null; then
 else
   echo "      already wired in /root/.bashrc"
 fi
+
+echo "[5/5] git transport"
+# GitHub over the direct route fails intermittently ("Error in the HTTP2 framing
+# layer"), so route git through the local proxy and speak HTTP/1.1.
+git config --global http.version HTTP/1.1
+git config --global http.proxy http://127.0.0.1:6666
+echo "      http.version=$(git config --global --get http.version) " \
+     "http.proxy=$(git config --global --get http.proxy)"
 
 cat <<EOF
 
