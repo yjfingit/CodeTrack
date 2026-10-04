@@ -552,10 +552,20 @@ def main() -> int:
         row = difference_in_differences(drop_a, drop_b, rng, args.draws)
         row["conditions"] = [name for name, _, _ in per_condition]
         row["relative"] = bool(args.composite_relative)
+        # The composite is a *post-hoc aggregation* of whatever conditions were named on the
+        # command line, so it is not part of the Holm family that ``family`` below corrects.  The
+        # flag is stored rather than left implicit: 6.26's headline "+3.65, p = 0.013" came from
+        # this path and was read as if it carried the pre-registration of the primary endpoint.
+        row["in_holm_family"] = False
+        row["family_note"] = ("composite over conditions named on the command line; outside the "
+                              "Holm family (correct it separately or report it as exploratory)")
         low, high = row["difference_ci95"]
         report["composite"] = {"a": label_a, "b": label_b, **row}
-        print(f"\n=== pre-registered composite {label_a} vs {label_b} over "
+        print(f"\n=== composite {label_a} vs {label_b} over "
               f"{len(per_condition)} conditions ({unit}) ===")
+        print("NOT part of the Holm family below: this contrast is defined by the conditions "
+              "passed on the command line, so treat it as exploratory and state the aggregation "
+              "rule before the run if it is to carry a pre-registered claim.")
         print("positive = the first arm degrades less; per-sequence mean drop, then the "
               "difference in differences")
         print(f"  conditions: {', '.join(name for name, _, _ in per_condition)}")

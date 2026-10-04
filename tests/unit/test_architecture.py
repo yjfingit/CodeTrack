@@ -357,6 +357,97 @@ def test_default_output_mode_still_applies_the_output_norm():
     assert decoder.residual_out is None and decoder.branch_norm is None
 
 
+def _state_mode_args(decoder, batch: int = 1, seed: int = 0):
+    """Fixed inputs for the state-mode tests, so only the loop semantics can differ."""
+    generator = torch.Generator().manual_seed(seed)
+    n, d, m = decoder.num_variables, 64, decoder.num_parity
+    return dict(
+        variables_rgb=torch.randn(batch, n, d, generator=generator),
+        variables_tir=torch.randn(batch, n, d, generator=generator),
+        parity=torch.randn(batch, m, 32, generator=generator),
+        syndrome=torch.rand(batch, 1, m, generator=generator),
+        reliability_rgb=torch.rand(batch, n, generator=generator),
+        reliability_tir=torch.rand(batch, n, generator=generator),
+        gate_rgb=torch.rand(batch, 8, generator=generator),
+        gate_tir=torch.rand(batch, 8, generator=generator),
+        node_index=torch.stack([torch.randperm(n, generator=generator)[:8]
+                                for _ in range(batch)]),
+    )
+
+
+def test_recurrent_state_mode_is_the_default_and_reads_the_updated_state():
+    """073c223 silently froze the branch input for every non-identity mode, so from round 2 on the
+    message functions read the decoder's *input* instead of the state round 1 produced.  That is a
+    change of function, not of numerics, and it shipped while the commit claimed the default path
+    was untouched (docs/results.md 6.27).  The default must be the pre-073c223 semantics, and it is
+    checked here against an independently written two-round loop rather than against itself."""
+    cfg = tiny_cfg()
+    decoder = CodeTrack(cfg).decoder.eval()
+    assert decoder.state_mode == "recurrent"
+    args = _state_mode_args(decoder)
+
+    with torch.no_grad():
+        out = decoder(**args)
+
+        # Independent re-implementation of the pre-073c223 loop for the post_norm path.
+        b = args["variables_rgb"].shape[0]
+        v = torch.cat([args["variables_rgb"], args["variables_tir"]], dim=0)
+        r = torch.cat([args["reliability_rgb"], args["reliability_tir"]], dim=0).unsqueeze(-1)
+        gate = torch.cat([
+            decoder._expand_gate(args["gate_rgb"], args["node_index"], b, v.shape[1],
+                                 args["variables_rgb"]),
+            decoder._expand_gate(args["gate_tir"], args["node_index"], b, v.shape[1],
+                                 args["variables_tir"]),
+        ], dim=0).unsqueeze(-1)
+        h = decoder._h()
+        parity_c = args["parity"].repeat(2, 1, 1)
+        s_col = args["syndrome"].repeat(2, 1, 1).flatten(1).unsqueeze(-1)
+        parity_ctx = decoder.parity_proj(parity_c)
+        m_cv = torch.zeros_like(v)
+        for _ in range(decoder.iterations):
+            m_vc = torch.einsum("cv,bvd->bcd", h,
+                                decoder.v_msg(torch.cat([v, r], dim=-1)))
+            c_in = torch.cat([m_vc, parity_ctx, s_col.expand(-1, -1, 1)], dim=-1)
+            m_cv = torch.einsum("cv,bcd->bvd", h, decoder.c_msg(c_in))
+            delta = decoder._step(decoder.update(torch.cat([v, m_cv], dim=-1)))
+            v = v + (1.0 - r) * gate * delta
+        reference = decoder.out_norm(v)
+
+    assert torch.equal(torch.cat([out["corrected_rgb"], out["corrected_tir"]]), reference), \
+        "the default state mode no longer reproduces the pre-073c223 message-passing loop"
+
+
+def test_held_state_mode_differs_only_from_the_second_round():
+    """The break 073c223 introduced is localised: with one round there is no previous state to
+    read, so the two modes must agree bit for bit.  With two rounds they must not -- otherwise the
+    flag would be decorative and the equivalence tool would be measuring nothing."""
+    cfg = tiny_cfg()
+    decoder = CodeTrack(cfg).decoder.eval()
+
+    for iterations, should_differ in ((1, False), (2, True)):
+        decoder.iterations = iterations
+        args = _state_mode_args(decoder)
+        with torch.no_grad():
+            decoder.state_mode = "recurrent"
+            recurrent = decoder(**args)["corrected_rgb"]
+            decoder.state_mode = "held"
+            held = decoder(**args)["corrected_rgb"]
+
+        if should_differ:
+            assert not torch.allclose(recurrent, held), \
+                f"iterations={iterations}: 'held' should change the second round's input"
+        else:
+            assert torch.equal(recurrent, held), \
+                "with a single round the state mode cannot matter"
+
+
+def test_unknown_state_mode_is_rejected():
+    cfg = tiny_cfg()
+    cfg["model"]["decoder_state_mode"] = "sideways"
+    with pytest.raises(ValueError, match="decoder state_mode"):
+        CodeTrack(cfg)
+
+
 def test_explicit_mlp_width_overrides_the_auto_formula():
     """The stored arm in ``outputs/ab_mlp_corr`` was trained at 2048 hidden (the pre-fix
     auto formula) and cannot be rebuilt without naming the width.  ``mlp_hidden=0`` must stay

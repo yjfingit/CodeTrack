@@ -45,11 +45,21 @@ that the effect is absent.
 | the extra diagnostics forward biases the comparison | no: +0.3 to +0.5 points, not significant | 6.11 |
 | a diverged closed loop is a real failure mode here | yes: 8 928 of 10 244 frames (87.2 %) hit the crop bound under `both@0.4`, the worst sequence 197/200 and five sequences above 190; the counter is now reported with every run | 6.15 |
 | what the current design could ever detect | 3 SR points needs ~151 sequences at m = 1; 1 point needs >1300.  The enlarged 150-sequence split is built and ready | 6.13, 6.17 |
+| the review round left the default decoder path bit-identical | **retracted**: `073c223` froze the branch input for every non-identity output mode, so `post_norm`/`mlp`/`spatial` changed function from round 2 on (max abs difference 0.08-0.24 at output scale 1).  `model.decoder_state_mode` now names the semantics and the guard refuses a mismatch | 6.27.1 |
+| `applied/oracle = 34.4` is a step-size overshoot | **misnamed**: it is `L1(applied)/L1(oracle)`, an error ratio.  The step ratio `a_applied/a*` is now reported separately | 6.27.3 |
+| the fixed-crop replay saw the same crops as the free run | **no**: the reference schedule was applied one frame early, and the check that was supposed to catch it was `... or len(gt) > 0`, i.e. always true.  Fixed and to be re-run; the TIR reading of 6.12 is provisional | 6.12, 6.27.3 |
+| "N frames clamped" means the loop diverged | **too coarse**: the counter mixed scale, centre, non-positive and non-finite events.  Only the scale count means unbounded growth; the breakdown is now stored per run and per sequence | 6.15, 6.27.3 |
+| the family-wise error rate of 6.13 was the family-wise rate | **no**: it counted P(this hypothesis rejected) and drew an independent sample per comparison.  Corrected to P(any rejection) with shared resampling; 6.13's power figures are superseded | 6.13, 6.27.3 |
+| the 6.26 composite is pre-registered | **no**: 6.20 pre-registered `tok_noise_rgb_04` (primary) and `tok_block_rgb_04` (secondary); the two-condition composite is a post-hoc aggregation and is now marked `in_holm_family: false` and exploratory | 6.20, 6.26, 6.27.3 |
+| every number here can be tied to the code that produced it | **no**: the provenance schema is new, so all 74 pre-existing runs are unattributable by construction and the round-2 numbers must be produced again rather than extended | 6.27.2 |
 
 
 Two structural notes that apply to every row: all paired intervals resample **sequences** (never
 frames), and every family of tests is corrected with Holm over *the whole family*, condition
-comparisons and interactions together.
+comparisons and interactions together.  The `--composite` output of `tools/summarize_paired_conditions.py`
+is **outside** that family by construction (it is defined by the conditions named on the command
+line) and is stored with `in_holm_family: false`; it is exploratory unless a pre-registration names
+the aggregation rule in advance (section 6.27.4).
 
 ### 6.1 RGB/TIR frame pairing (`tools/pairing_audit.py`)
 
@@ -624,10 +634,25 @@ shipped `ab_full`.**  The four arms were trained in one session with the same co
 budget and `--override` set, so differences *between them* are attributable to the arm settings.
 The shipped checkpoint predates the review-round code changes, and its final training losses
 differ slightly from arm A's (loss 3.2492 vs 3.1390; `track` 0.4205 vs 0.4826; `detect` 1.7573 vs
-1.6508), which is the expected consequence of the corruption/sampling RNG stream having shifted
-at some point between the two runs.  Therefore: **no result is reported as A vs `ab_full`**; the
-shipped arm is quoted only as the historical reference whose step-probe ratios the new arms are
-compared against.
+1.6508).
+
+**Correction (6.27.1).**  This paragraph first attributed that difference to "the corruption/sampling
+RNG stream having shifted at some point between the two runs".  That was a guess, and it was not
+checked against the one difference that is *guaranteed* to change the loss: `073c223` silently
+changed the decoder loop's state semantics, so from round 2 on the message functions read the
+decoder's input instead of the state round 1 produced.  The two candidate causes are not
+distinguishable from the loss values, and the honest status is **not attributed**.  Arm A is a
+`held`-semantics arm and needs `--override model.decoder_state_mode=held` to be rebuilt; the
+default is now `recurrent`, which is what `ab_full` was trained under.  The equivalence run is
+`outputs/decoder_state_equivalence.json`.
+
+**Metric naming (6.27.3).**  The `applied / oracle` values quoted below are
+`L1(applied)/L1(oracle)`, an **error** ratio; they are not the step-size overshoot factor.  The
+step ratio `a_applied/a*` is reported separately by `tools/step_size_probe.py`, because the two
+numbers were previously conflated and 34.4 was read as "the step is 34 times too large".
+
+Therefore: **no result is reported as A vs `ab_full`**; the shipped arm is quoted only as the
+historical reference whose step-probe ratios the new arms are compared against.
 
 The P4 arm's losses are a useful cross-check of the deviation target: `detect` 1.0510 with
 `rel` 0.276 and `syn` 0.358, against 1.6508 / 0.014 / 0.568 for the mask target -- the soft target
@@ -1064,19 +1089,32 @@ shrinking the family does.  (`tools/summarize_paired_conditions.py --metric iou_
 the full paired/Holm/composite machinery on the endpoint once the runs that record it have
 finished, so this conclusion can be re-checked rather than trusted.)
 
-The failure-time endpoint is still worth reporting, because it says what the tracker *does*
-rather than how it scores.  With the forward-decidable definition (20 consecutive frames below
-IoU 0.5) on the 60-sequence split (`outputs/horizon_probe_ab_full.json`):
+The failure-time endpoint is still worth reporting, because it says what the tracker *does* rather
+than how it scores.  With the 20-consecutive-frames-below-IoU-0.5 rule on the 60-sequence split
+(`outputs/horizon_probe_ab_full.json`):
 
 * **78.3 %** of sequences fail within the 200-frame horizon;
 * the **median failure frame is 16** (mean censored time-to-failure 63.6 frames of 200);
 * once failed, only **12.8 %** ever recover.
 
-The clean SR of 0.34 is therefore not "tracks at 0.34 quality for 200 frames": it is "tracks for
-about 16 frames and then loses the target permanently on four sequences out of five".  That is
-the single most useful descriptive number in this document for interpreting every other table,
-and it is why the arm contrasts are read as *robustness* (how much worse corruption makes an
-already-fragile loop) rather than as an absolute capability.
+**Wording correction (6.27.3).**  Three things this listing used to imply and should not.
+
+1. "**Permanently**" was inferred from a 200-frame window.  47 of 60 sequences fail and 6 of those
+   47 recover, so the observed quantity is **68.3 % (41/60) failing without recovering within the
+   window**; nothing here speaks to behaviour past frame 200.
+2. The **median failure frame of 16 is the median over the sequences that failed**, not a survival
+   median over all sequences, and it is the *start* of the failing run.  The event is only knowable
+   online `patience - 1 = 19` frames later, at a median confirmed frame of 35; the tool now stores
+   both (`failure_frame`, `failure_confirmed_frame`) and prints the pair.
+3. The claim "tracks for about 16 frames and then loses the target permanently on four sequences
+   out of five" below is therefore too strong; the corrected reading is "on 41 of 60 sequences the
+   target is lost within the window and not recovered inside it".
+
+The clean SR of 0.34 is not "tracks at 0.34 quality for 200 frames": it is a loop that usually
+loses the target early and then does not come back.  That is the most useful descriptive number in
+this document for interpreting every other table, and it is why the arm contrasts are read as
+*robustness* (how much worse corruption makes an already-fragile loop) rather than as an absolute
+capability.
 
 ### 6.18 P4 pre-registration: mask vs deviation supervision, decided on a held-out mechanism
 
@@ -1502,6 +1540,21 @@ Per condition the primary contrast is `tok_block_rgb_04` -1.00 points ([-7.25, 5
 `tok_noise_rgb_04` -0.60 ([-4.47, 3.13], p = 0.761).  Every interval bounds any effect at roughly
 4-5 SR points, and the null repeats on the mean-IoU endpoint (6.24 addendum below).
 
+**What these contrasts are, and are not (6.27.1).**  All four arms A-D contain the correction
+branch; every one of them is a BP arm.  A-vs-D changes the *output parameterisation* while
+changing the gate setting at the same time, so it is a contrast between two correction
+configurations, **not** "with versus without the error-correction module".  The module-level
+comparison is 6.16 (`decoder_mode=off`) and it is likewise unresolved.  Reading -0.80 as "the
+correction module buys nothing" is a category error, and the phrase was used that way in earlier
+summaries of this section.  Arm A is additionally a `held`-semantics arm (see 6.10 correction and
+6.27.1), so it can only be re-evaluated with `--override model.decoder_state_mode=held`.
+
+**The "34.4 / 35.0" figures quoted in step 1 are `L1(applied)/L1(oracle)`, an error ratio**, not a
+step-size overshoot factor; the step ratio `a_applied/a*` is a separate number (6.27.3).  The
+mechanism claim -- that the `post_norm` update *raises* the damaged-token error while the
+identity-residual one *lowers* it (0.1856 -> 0.1705, an 8.1 % reduction) -- is unaffected, because
+that is a statement about which direction the error moves, not about how the two ratios are named.
+
 **Prediction 1 of 6.22 is therefore not confirmed.**  Despite a 32x difference in token-level
 damage, the two arms degrade by the same amount under corruption.  Prediction 4 of 6.22 applies
 verbatim: the conclusion is *not* "the parameterisation is worthless" but "the token-level repair
@@ -1606,16 +1659,38 @@ Paired over the 60 sequences, C minus spatial (`outputs/validation_v1/summary_C_
 contrast -- the endpoint the whole project is built around -- the parameter-matched spatial mixer
 and the designed BP arm are **indistinguishable** (+0.10 points, CI spanning zero), and on the
 level the BP arm is ahead by 2.6-3.9 points, of which only one condition reaches nominal
-significance.  Two readings follow, and both belong in the paper:
+significance.  Two readings follow:
 
-* Everything the shipped checkpoint achieves on tracking is reachable by a mixer that has no
-  Tanner graph at all (0.353 vs 0.339 clean; 0.252 vs 0.249 on `tok_block_rgb_04`).  The
-  parity/syndrome/locator machinery is therefore **not necessary** for the tracking performance that
-  has been reported.
+* Everything the shipped checkpoint achieves on tracking is reachable by a mixer whose *direct
+  message update* is a 3x3 depthwise convolution.  What the spatial arm replaces is the
+  variable-to-check/check-to-variable message passing, not the whole system.
 * The one configuration that is ahead of the spatial control is arm C -- and its advantage comes
   from the **output parameterisation plus the learned gate**, not from the graph: the same graph with
   `post_norm` (A) is 6.5 clean points *below* the spatial mixer, and the same graph with the gate
   forced off (D) is 7.6 points below it.
+
+**Scope correction (6.27.1).**  An earlier version of this section concluded that "the Tanner graph
+is therefore **not necessary**".  That overstates what this arm can show, for two independent
+reasons.
+
+1. The spatial arm is **not** a Tanner-free system.  `codetrack/models/codetrack.py` runs
+   `H -> parity -> Tanner -> syndrome -> locator -> gate` unconditionally, whatever
+   `decoder_mode` is, and hands the resulting gate to the decoder.  The spatial mode swaps the
+   *message update* only; syndrome, locator, incidence and gating are all still there.
+2. The arm was built with the default `post_norm` output, which its own step probe shows overshoots
+   by ~2.8x.  So "spatial context is sufficient" is measured on a spatial arm that is handicapped by
+   the parameterisation the same document shows is broken.
+
+The defensible statement is: **under the current control path and recipe, ordinary spatial mixing
+substitutes for the direct BP message update with no measurable loss.**  Negating the whole Tanner
+system needs a second arm in which the gate is produced by something that does not consume
+syndrome or locator at all; the parameterisation-matched spatial arm (spatial + identity_residual +
+learned gate) is the first step and is pre-registered in 6.27.4.
+
+Also note that p = 0.937 is not a demonstration of equivalence.  The interval is [-2.50, +2.55]
+points, so the supported claim is "no difference larger than about 2.5 points", and only if a
++/-3-point equivalence bound is accepted *in advance*.  With the measured sigma_D the design cannot
+resolve anything smaller (6.17).
 
 **What this control does not settle**: whether *adding* the graph to a model that already has the
 identity-residual output and a learned gate buys anything over the spatial mixer with the same
@@ -1644,10 +1719,18 @@ Difference in differences, `D = drop(p4) - drop(full)`, positive = the mask arm 
 |---|---:|---:|---:|---|---:|
 | `tok_noise_rgb_04` (**pre-registered primary**) | -2.35 | -1.23 | **+1.11** | [-0.57, 2.97] | 0.227 |
 | `tok_block_rgb_04` (secondary) | +9.03 | **+15.22** | **+6.19** | [1.02, 11.77] | **0.028** |
-| **composite over both (m = 1)** | +3.34 | +6.99 | **+3.65** | [1.01, 6.48] | **0.013** |
+| composite over both (m = 1, **exploratory**) | +3.34 | +6.99 | **+3.65** | [1.01, 6.48] | **0.013** |
+
+**Correction (6.27.3): the composite row is not pre-registered.**  6.20 fixed the primary endpoint
+(`tok_noise_rgb_04`) and one secondary (`tok_block_rgb_04`); averaging the two into a single
+contrast was decided when the numbers were in, and `tools/summarize_paired_conditions.py` now marks
+every `--composite` result `in_holm_family: false` and says so on stdout.  The composite is an
+honest summary of this sample and it is the row that excludes zero, but it may not be quoted as a
+pre-registered test, and the pre-registered verdict on this contrast is the *primary* row: no
+difference.  The two rows are therefore reported together and labelled, not merged.
 
 **Pre-registered decision**: the primary endpoint does **not** confirm a difference (+1.11 points,
-interval spanning zero), and the composite over both conditions puts the deviation arm **3.65 SR
+interval spanning zero), and the compound reading over both conditions puts the deviation arm **3.65 SR
 points worse** with an interval that excludes zero (p = 0.013).  So the honest verdict is not
 "the deviation target hurts tracking" on the pre-registered condition alone, but "the arm with the
 better detector and repairer is not better and is measurably worse in aggregate".
@@ -1658,13 +1741,40 @@ healthy tokens) tracks *worse* under corruption** -- it loses 15.2 points where 
 arm loses 9.0, a difference of 6.2 points with an interval that excludes zero.  Clean levels are
 comparable (0.329 vs 0.339), so this is not a level artefact.
 
-That is the same pattern as 6.24, from an independent manipulation: **the tracking outcome is not
-sensitive to the token-level quality of the repair.**  In 6.24 the geometry was fixed (34x -> 1.00x
-overshoot, error reduced instead of inflated) and the robustness contrast did not move; here the
-detection and repair were improved by a different loss and the robustness contrast moved *against*
-the arm with the better repair.  Two independent changes to the correction mechanism, neither of
-which produced the expected tracking gain, is a much stronger statement than either alone:
-whatever limits this tracker, it is not the quality of the per-token correction.
+That is the same pattern as 6.24, from an independent manipulation: **no tracking benefit followed
+from improving the token-level quality of the repair, and on this sample the arm with the better
+repair tracked worse in aggregate.**  In 6.24 the geometry was fixed and the robustness contrast
+did not move; here the detection and repair were improved by a different loss and the robustness
+contrast moved against the arm with the better repair.  Two independent changes to the correction
+mechanism, neither producing the expected tracking gain, is a stronger statement than either alone.
+
+**How far that statement goes, and where it stops (6.27).**  An earlier version of this paragraph
+concluded "whatever limits this tracker, it is not the quality of the per-token correction".  That
+is stronger than the measurements support, for four reasons that are each individually enough:
+
+* **The A-vs-D contrast of 6.24 is not a module switch.**  Both arms contain the correction branch,
+  and they differ in the output parameterisation *and* the gate setting at once, so it cannot
+  attribute anything to the module (6.27.1).
+* **`L1(applied)/L1(oracle)` is an error ratio, not a step calibration.**  Reducing it from 34 to
+  1.0 while the error falls 8.1 % is a real mechanism improvement, but it does not show the step was
+  matched to `a*` (6.27.3).
+* **The two manipulations do not act on one mediator.**  `identity_residual` changes scale,
+  initialisation and output distribution; the deviation target changes the reliability calibration,
+  and the control variable is `(1 - r)`, so a better AUROC ranking can coexist with a worse
+  effective update magnitude.
+* **The teacher is token-clean, not image-clean** -- the dataset applies image-level corruption
+  before the backbone -- so all of these numbers are about repairing *token* damage in an
+  already-degraded representation.  A repair that improves background tokens, or tokens in the
+  teacher's coordinate frame, need not improve foreground localisation.
+* **The auxiliary objective may be actively harming tracking rather than merely failing to help.**
+  With `lambda_correct = 2.0` and `lambda_preserve = 0.5`, the gradient the shared weights receive is
+  `g_track + Σ λᵢ gᵢ`; the unweighted `cos(L_track, L_correct)` that was the only thing measured
+  cannot separate those two cases.  The weighted diagnostic now can (6.27.3), and on a 25-step
+  smoke run the auxiliary gradient is already 2.07x the tracking gradient and opposed.
+
+So the supported claim is: **no transfer of token-level repair quality to tracking robustness has
+been observed**, and the mechanism that limits this tracker has not been identified.  Distinguishing
+"repair is ineffective" from "repair is harmful" is one of the pre-registered items of 6.27.4.
 
 **A gap in my own pre-registration, stated plainly -- and closed.**  The primary endpoint was
 `tok_noise_rgb_04`, but `ab_full` had no run for it: the condition was introduced *after* `ab_full`'s
@@ -1676,6 +1786,145 @@ pre-registration that names a condition nobody runs is not a pre-registration; t
 have caught it -- does every arm have every condition the protocol names? -- is the same class of
 gap as 6.23, and it is worth a guard in the runner (every condition in the protocol listed for every
 arm, with a missing cell reported as a missing cell rather than silently omitted from a comparison).
+
+### 6.27 Round-2 truth-fix, provenance, and pre-registration
+
+A third review (of `073c223`) found defects that change how earlier numbers must be read, and the
+fixes cost no training.  They come first because a comparison whose two arms were evaluated by
+different code is not a comparison, and enlarging the sample cannot repair a mislabelled
+estimator.  Everything in this section is produced by a script under `tools/`.
+
+#### 6.27.1 The default decoder path was **not** bit-identical after `073c223`
+
+`073c223` replaced `v` with `branch_input` inside the decoder loop but refreshed `branch_input`
+only when `output_mode == "identity_residual"`.  For every other mode that changed the *function*:
+from round 2 on, the message and update functions read the decoder's **input** instead of the state
+round 1 produced, so the iterations stopped composing.  Nothing moved in the state dict, so
+`load_checkpoint` could not notice, and the commit message -- and this document -- described the
+default `post_norm` path as unchanged.  It was not.
+
+`tools/decoder_state_equivalence.py` measures it.  It builds one decoder, copies the weights into
+three instances and runs identical inputs through (a) `recurrent` -- the shipped default, (b)
+`held` -- what `073c223` silently did, and (c) an **independently written re-implementation** of
+the pre-`073c223` loop, so the check is not circular.  `outputs/decoder_state_equivalence.json`:
+
+| mode | output | rounds | `max\|recurrent − held\|` | `max\|recurrent − parent\|` |
+|---|---|---:|---:|---:|
+| bp | post_norm | 1 | 0 | **0** |
+| bp | post_norm | 2 | 0.082 | **0** |
+| bp | post_norm | 3 | 0.240 | **0** |
+| mlp | post_norm | 2 | 0.093 | **0** |
+| spatial | post_norm | 2 | 0.138 | **0** |
+
+`recurrent` reproduces the pre-`073c223` loop bit for bit on every `post_norm` cell, and the two
+modes are bit-identical at one round, which localises the break to multi-round state.  On outputs
+with unit scale a difference of 0.08-0.24 is a real change of function, not numerical noise.
+
+**Consequences, all of which are now explicit.**
+* `model.decoder_state_mode` is a config key with a `load_checkpoint` guard, exactly like
+  `decoder_output` and `gate_always_one`.  The default is `recurrent`.
+* The P2 arms **A and B** (and the shipped `post_norm` lineage) were trained under one semantics
+  and, wherever they were evaluated after `073c223`, evaluated under the other.  Arms C and D
+  (`identity_residual`) always refreshed, so they are self-consistent.  Rebuilding A or B needs
+  `--override model.decoder_state_mode=held`.
+* **The provenance paragraph of 6.10 is superseded.**  It attributed arm A's mismatch with
+  `ab_full` to "the corruption/sampling RNG stream having shifted".  That explanation was never
+  checked against the one difference that is guaranteed to change the loss: the decoder loop's
+  state semantics.  The correct status is *not attributed*: the mismatch has at least two candidate
+  causes, and identifying which needs the equivalence run plus a matched re-evaluation.
+* The claim "the default path is bit-identical", wherever it appears, is **retracted**.
+
+#### 6.27.2 Nothing in the repository could be attributed to a commit
+
+`tools/run_provenance_audit.py` walks `outputs/` for training provenance and evaluation manifests
+and reports, per run, the training commit, the evaluation commit, the dirty flag and the function
+switches.  First run (`outputs/run_provenance_audit.json`): **74 runs, 74 not comparable** -- every
+existing number predates the schema, so none of them can be tied to a commit.  This is not a
+surprise given the schema is new, but it is the reason the round-2 numbers have to be produced
+again rather than extended.
+
+The schema now travels with every run: `run_provenance.json` for training (commit, dirty flag,
+`decoder_state_mode`, `decoder_output`, `gate_always_one`, active parameters, peak memory) and
+`eval_provenance` plus the checkpoint's own `train_provenance` inside every evaluation
+`run_manifest.json`.  Two consequences for the round-2 experiments: **the provenance of the two
+arms of any comparison must match**, and **a dirty tree invalidates attribution** even when the
+commit matches.
+
+#### 6.27.3 What the earlier metrics actually measured
+
+Four names were wrong or too coarse.  Each now has a separate measurement, because in every case
+the old single number was read as the narrower one.
+
+| was called | actually was | now also reported |
+|---|---|---|
+| "applied/oracle = 34.4 (step overshoot)" | `L1(applied)/L1(oracle)`, an **error** ratio (`tools/compare_step_probes.py:56`) | `a_applied/a*`, the multiplier ratio along the ideal direction (`tools/step_size_probe.py`) |
+| "N frames clamped (diverged)" | four events in one counter: scale, centre, non-positive, non-finite (`codetrack/engine/trainer.py:clamp_box`) | `n_box_clamps_by_reason` per run, `box_clamps_by_reason` per sequence, and a `scale rate` column in `tools/divergence_report.py` |
+| "the crops are identical" | `allclose(frame 0 predictions) or len(gt) > 0`, i.e. always true | crops recorded per frame by the loop; `crop_identical` (frame 0) and `crop_identical_frames` (how far the loops stayed together) |
+| "forward-decidable failure at frame *t*" | the **start** of the failing run, knowable only at `t + patience − 1` | `failure_confirmed_frame`, plus an RMST endpoint (`tools/horizon_probe.py`) |
+
+Two of these had a second defect behind them.
+
+* **The fixed-crop reference was misaligned by one frame.**  The free loop crops frame *f* around
+  the box produced for *f − 1* (and around the frame-0 annotation for *f = 0*), never around its own
+  output for *f*.  Passing `reference[f]` gave the replay a crop the free run never saw and handed
+  it the reference's answer one frame early.  `crop_box_for_frame` now lags the schedule, and frame
+  0 stays annotation-driven in every arm.  **Every fixed-crop result is therefore provisional**,
+  including the TIR reading of 6.12; the re-run is part of the round-2 plan, not optional.
+* **The `power_plan.py` FWER row was the wrong probability.**  `simulate_power` checked
+  `0 in holm_rejected(...)`, i.e. P(this hypothesis is rejected), not P(any rejection in the
+  family) -- so the "FWER" row of 6.13 was roughly alpha by construction.  It also drew an
+  independent sample per comparison, destroying the positive correlation between contrasts measured
+  on the same sequences.  `family_wise_rejection_rate` now counts *any* rejection, and one resample
+  is shared across the family (an `(m × n)` effect matrix can be passed for the realistic joint
+  structure).  The corrected numbers are conservative where the old ones were optimistic, so
+  **6.13's power figures are superseded and must be regenerated.**
+* `--composite` in `tools/summarize_paired_conditions.py` writes `in_holm_family: false` and says so
+  on stdout.  The composite is defined by the conditions named on the command line, so it is not in
+  the Holm family that the same script corrects; 6.26's "+3.65 points, p = 0.013" came from this
+  path and was read as if it carried the primary endpoint's pre-registration.  See 6.27.4.
+* `tools/gradient_conflict_report.py` reported only the **unweighted** `cos(L_track, L_correct)` on
+  three modules, which cannot separate "repair is ineffective" from "repair is harmful": the
+  optimiser sees `g_track + Σ λᵢ gᵢ`.  The trainer now logs the weighted reading too, and the
+  report aggregates it (mean, minimum, ratio `‖g_aux‖/‖g_track‖`, by thirds of the run, and the
+  fraction of steps that are *opposed and loud*).  On the 25-step smoke run the unweighted pair
+  looks benign (mean cos −0.03, gradient ratio 0.87) while the weighted auxiliary gradient is
+  **2.07× the tracking gradient** and opposed at every logged step.  That is a smoke run, not a
+  result, but it is the measurement 6.27.4 needs.
+
+#### 6.27.4 Round-2 pre-registration (written before the runs)
+
+Fixed now, so the round-2 results cannot be read selectively afterwards.
+
+* **Primary contrast**: the decoder arm against the identical network with the correction branch
+  switched off (`model.decoder_mode=off`) -- the project's own claim, and **not** the A-vs-D
+  parameterisation contrast of 6.24.  Primary condition `rgb_occl_04`, secondary
+  `tok_block_rgb_04` (as in 6.17).  **m = 1**; every other condition comparison and interaction
+  joins the Holm family.
+* **Minimum useful effect: 3 SR points.**  Anything smaller is reported as "not measured", not as
+  evidence of no effect, and sample sizes are computed from the *measured* σ_D of the contrast
+  being tested (106-287 sequences over the observed 11-18 range), never from the smallest σ.
+* **Secondary endpoints, pre-declared as mechanistic**: RMST up to τ and the confirmed failure
+  fraction (`tools/horizon_probe.py`), and mean frame IoU.  None of them replaces the primary SR
+  contrast; switching the *primary* endpoint after seeing results is not permitted.
+* **Exploratory by construction** (must be labelled as such wherever reported): the composite over
+  two conditions, any contrast on a condition introduced after the fact, and any comparison whose
+  two arms differ in a function switch (`decoder_state_mode`, `decoder_output`, `gate_always_one`)
+  without the matching override.
+* **Fairness requirements for any "the module helps" statement**: matched initialisation for shared
+  modules, matched optimizer steps *and* effective batch *and* precision *and* sample exposure, the
+  measured active-parameter count, and FLOPs/latency.
+* **Order of work**, decided here so a null result cannot be chased with a new endpoint: fix the
+  measurements (this section), then the zero-training diagnostics, then the two training contrasts,
+  then replication, then the enlarged split.
+* **Standing limitation**: one seed per arm and one severity.  A single-seed p-value contains no
+  information about *training* variance; seed variance is reported separately from sequence
+  variance wherever a mechanism claim is made.
+
+| pre-registered contrast | arms | endpoint | state |
+|---|---|---|---|
+| decoder vs branch-off | `ab_full` vs `ab_nodec_corr` (re-evaluated under matching semantics) | DiD on `rgb_occl_04`, m = 1 | not yet run under matching provenance |
+| LoRA vs frozen, at fixed capacity budget | F0/F1/A0/A1 | the interaction `(A1−A0) − (F1−F0)` | not started |
+| spatial+identity_residual+gate vs arm C | new arm vs `p2_C` | robustness composite | not started |
 
 ## 1. Clean evaluation (no injected corruption)
 | Tracker | Backbone | Params (M) | GFLOPs | FPS | Dataset | PR | SR (AUC) | NPR |

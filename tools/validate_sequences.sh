@@ -106,25 +106,35 @@ wait
 echo "[$(date +%H:%M:%S)] all conditions finished"
 
 "$PYTHON_BIN" - "$OUT_DIR" "$TOKEN_LABEL" "$CHECKPOINT" "$SEQ_LIST" "$FRAMES" \
-  "$CONDITIONS" "${OVERRIDES:-}" > "$OUT_DIR/run_manifest.json" <<'PY'
+  "$CONDITIONS" "${OVERRIDES:-}" "$CONFIG" > "$OUT_DIR/run_manifest.json" <<'PY'
 import json
-import platform
-import subprocess
 import sys
+from pathlib import Path
 
-out_dir, label, checkpoint, seq_list, frames, conditions, overrides = sys.argv[1:8]
+sys.path.insert(0, ".")
+from codetrack.utils.provenance import git_provenance   # noqa: E402
+
+out_dir, label, checkpoint, seq_list, frames, conditions, overrides, config = sys.argv[1:9]
+
+# The checkpoint's own provenance travels with the evaluation: comparing an arm evaluated at
+# commit X against an arm evaluated at commit Y is only meaningful if both are stated
+# (docs/results.md 6.27).
+train_provenance = {}
+train_path = Path(checkpoint).parent / "run_provenance.json"
+if train_path.exists():
+    train_provenance = json.loads(train_path.read_text())
+
 manifest = {
     "label": label,
     "checkpoint": checkpoint,
+    "checkpoint_dir": str(Path(checkpoint).parent),
     "sequence_list": seq_list,
     "max_frames": int(frames),
     "conditions": conditions.split(),
+    "config": config,
     "config_overrides": overrides.split(),
-    "cwd": subprocess.run(["pwd"], capture_output=True, text=True).stdout.strip(),
-    "cpu_thread_env": {k: v for k, v in __import__("os").environ.items()
-                       if k.endswith("_NUM_THREADS") or k.startswith("CODETRACK_")},
-    "python": sys.version,
-    "platform": platform.platform(),
+    "eval_provenance": git_provenance(Path(".")),
+    "train_provenance": train_provenance,
 }
 print(json.dumps(manifest, indent=2))
 PY

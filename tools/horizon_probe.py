@@ -82,6 +82,68 @@ def first_failure(iou: np.ndarray, threshold: float = 0.5, patience: int = 20
     return None
 
 
+def failure_confirmed_frame(failure: Optional[int], patience: int) -> Optional[int]:
+    """The first frame at which the failure is *knowable* online.
+
+    :func:`first_failure` deliberately reports the **start** of the failing run, because that is the
+    interpretable event time.  But a tracker can only act on it once ``patience`` consecutive
+    frames have been observed, so the two differ by ``patience - 1`` frames -- 19 frames under the
+    20-frame rule used throughout ``docs/results.md``.  Reporting only the start frame next to the
+    phrase "forward-decidable" overstates how early the event is available, so both are stored.
+    """
+    if failure is None:
+        return None
+    return int(failure) + int(patience) - 1
+
+
+def rmst(times: np.ndarray, events: np.ndarray, tau: int) -> float:
+    """Restricted mean survival time: mean frames tracked, censored at ``tau``.
+
+    ``times`` are time-to-event values; ``events`` marks whether the event was observed (1) or the
+    sequence was still tracked at the horizon (0, right-censored).  Kaplan-Meier areas are used
+    rather than a plain mean so that sequences which never failed are not silently treated as if
+    they had failed exactly at the horizon.
+
+    Why this endpoint exists: SR and mean IoU both collapse a trajectory into one number, and
+    section 6.17.1 measured that mean IoU is *not* the lower-variance option.  RMST keeps the
+    time dimension, is right-censoring aware, and is the endpoint a "delays failure" claim is
+    actually about.  It is a **mechanistic secondary** endpoint, never a replacement for the
+    pre-registered SR contrast.
+    """
+    times = np.asarray(times, dtype=float)
+    events = np.asarray(events, dtype=float)
+    if times.size == 0:
+        return float("nan")
+    horizon = float(min(tau, times.max()))
+    if horizon <= 0:
+        return 0.0
+    # Ties are grouped: frame indices are integers, so several sequences routinely fail at the
+    # same frame, and treating them one at a time would give each a different risk-set size.
+    order = np.argsort(times)
+    times, events = times[order], events[order]
+    area = 0.0
+    previous = 0.0
+    survival = 1.0
+    at_risk = times.size
+    index = 0
+    while index < times.size:
+        time = float(times[index])
+        if time > horizon:
+            break
+        stop = index
+        while stop < times.size and float(times[stop]) == time:
+            stop += 1
+        area += survival * (time - previous)
+        previous = time
+        events_here = float(events[index:stop].sum())
+        if events_here and at_risk > 0:
+            survival *= (1.0 - events_here / at_risk)
+        at_risk -= stop - index
+        index = stop
+    area += survival * (horizon - previous)
+    return float(area)
+
+
 def recovered_after(iou: np.ndarray, failure: Optional[int], threshold: float = 0.5,
                     patience: int = 20) -> Optional[bool]:
     """Did a run of ``patience`` consecutive frames at or above threshold follow the failure?"""
@@ -110,6 +172,9 @@ def main() -> int:
                         help="consecutive frames below the threshold that count as a failure; "
                              "this is the forward-decidable definition")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--rmst-tau", type=int, default=200,
+                        help="horizon of the restricted mean survival time endpoint; must be "
+                             "within the follow-up both arms actually have")
     parser.add_argument("--out", default="outputs/horizon_probe.json")
     parser.add_argument("--override", action="append", default=[])
     args = parser.parse_args()
@@ -154,7 +219,10 @@ def main() -> int:
             "iou_mean_first": float(iou[:window].mean()),
             "iou_mean_last": float(iou[-window:].mean()),
             "loss_frame": lost,
+            # the event *start*; interpretable, and what a "median failure frame" means
             "failure_frame": failure,
+            # the frame at which the event is knowable online: start + patience - 1
+            "failure_confirmed_frame": failure_confirmed_frame(failure, args.patience),
             "recovered_after_failure": recovered,
             "time_to_failure_censored": (int(len(iou)) if failure is None else int(failure)),
             "tracked_fraction": 1.0 if lost is None else float(lost) / len(iou),
@@ -191,6 +259,18 @@ def main() -> int:
                                                   if row["failure_frame"] is not None]))
                                  if any(row["failure_frame"] is not None for row in valid)
                                  else None),
+        # The same statistic on the *konwable* frame.  The two differ by patience - 1, and quoting
+        # the start frame next to "forward-decidable" would overstate how early it is available.
+        "failure_confirmed_frame_median": (
+            float(np.median([row["failure_confirmed_frame"] for row in valid
+                             if row["failure_confirmed_frame"] is not None]))
+            if any(row["failure_confirmed_frame"] is not None for row in valid) else None),
+        # RMST: mean frames tracked up to tau, right-censoring aware.  A mechanistic endpoint for
+        # "does this arm delay failure", reported next to -- never instead of -- SR.
+        "rmst_tau": int(args.rmst_tau),
+        "rmst": rmst(np.array([row["time_to_failure_censored"] for row in valid], dtype=float),
+                     np.array([row["failure_frame"] is not None for row in valid], dtype=float),
+                     args.rmst_tau) if valid else float("nan"),
         "mean_time_to_failure_censored": (float(np.mean(
             [row["time_to_failure_censored"] for row in valid])) if valid else float("nan")),
         "recovery_rate_after_failure": (float(np.mean(
@@ -208,8 +288,9 @@ def main() -> int:
     Path(args.out).write_text(json.dumps(summary, indent=2))
     print(f"failure (patience {args.patience} < {args.threshold}): "
           f"{summary['failure_fraction'] * 100:.1f}% of sequences | median failure frame "
-          f"{summary['failure_frame_median']} | mean censored time-to-failure "
-          f"{summary['mean_time_to_failure_censored']:.1f} frames | recovery rate "
+          f"{summary['failure_frame_median']} (knowable at "
+          f"{summary['failure_confirmed_frame_median']}) | RMST(tau={summary['rmst_tau']}) "
+          f"{summary['rmst']:.1f} frames | recovery rate "
           f"{summary['recovery_rate_after_failure']:.2f}")
     print(f"{len(valid)} sequences | SR {summary['sr_mean']:.4f} | "
           f"mean IoU {summary['iou_mean']:.4f} | never lost "

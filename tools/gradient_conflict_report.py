@@ -25,6 +25,13 @@ from typing import Dict, List
 PATTERN = re.compile(
     r"\[grad\] cos\(L_track, L_correct\) = (?P<cos>[+-]?\d+\.\d+) \| \|g_track\| "
     r"(?P<g_track>\d+\.\d+) \| \|g_correct\| (?P<g_correct>\d+\.\d+)")
+# The weighted reading appended by the round-2 trainer.  Older logs lack it, and this tool has to
+# read both: an archived log cannot be re-generated, and saying "unknown" for it is the honest
+# outcome rather than pretending the unweighted pair is the whole story.
+WEIGHTED_PATTERN = re.compile(
+    r"\| cos\(L_track, g_aux\) = (?P<cos_aux>[+-]?\d+\.\d+) \| \|g_aux\| "
+    r"(?P<g_aux>\d+\.\d+) \| aux/track (?P<aux_over_track>\d+\.\d+) "
+    r"\| cos\(L_track, g_total\) = (?P<cos_total>[+-]?\d+\.\d+)")
 
 
 def series(path: Path) -> List[Dict[str, float]]:
@@ -33,9 +40,30 @@ def series(path: Path) -> List[Dict[str, float]]:
         return out
     for line in path.read_text(errors="ignore").splitlines():
         match = PATTERN.search(line)
-        if match:
-            out.append({key: float(value) for key, value in match.groupdict().items()})
+        if not match:
+            continue
+        row = {key: float(value) for key, value in match.groupdict().items()}
+        weighted = WEIGHTED_PATTERN.search(line)
+        if weighted:
+            row.update({key: float(value) for key, value in weighted.groupdict().items()})
+        out.append(row)
     return out
+
+
+def segments(rows: List[Dict[str, float]], key: str, parts: int = 3) -> List[float]:
+    """Mean of ``key`` over each third of the run.
+
+    A single mean hides the case that matters most for the "repair is harmful" hypothesis: a term
+    that is harmless early and opposed late, once the branch has learned to move the tokens.
+    Rows lacking the key are dropped rather than treated as zero, so a log written partly before
+    the weighted diagnostic existed still reports the segments it actually has.
+    """
+    present = [row for row in rows if key in row]
+    if not present:
+        return []
+    size = max(1, len(present) // parts)
+    return [sum(row[key] for row in chunk) / len(chunk)
+            for chunk in (present[i:i + size] for i in range(0, len(present), size))][:parts]
 
 
 def main() -> int:
@@ -46,7 +74,8 @@ def main() -> int:
 
     report: Dict[str, Dict[str, float]] = {}
     print(f"{'arm':<6} {'n':>4} {'mean cos':>9} {'min cos':>8} {'max cos':>8} "
-          f"{'mean |g_track|':>14} {'mean |g_correct|':>16} {'ratio':>7}")
+          f"{'mean |g_track|':>14} {'mean |g_correct|':>16} {'ratio':>7} "
+          f"{'cos(g_t,g_aux)':>15} {'aux/track':>10}")
     for spec in args.arm:
         label, _, path = spec.partition("=")
         if not path:
@@ -61,14 +90,42 @@ def main() -> int:
         mean_cos = sum(cos) / len(cos)
         mean_gt = sum(gt) / len(gt)
         mean_gc = sum(gc) / len(gc)
-        report[label] = {"n": len(rows), "mean_cos": mean_cos, "min_cos": min(cos),
-                         "max_cos": max(cos), "mean_g_track": mean_gt,
-                         "mean_g_correct": mean_gc,
-                         "gradient_ratio": (mean_gc / mean_gt) if mean_gt else float("nan")}
+        entry = {"n": len(rows), "mean_cos": mean_cos, "min_cos": min(cos),
+                 "max_cos": max(cos), "mean_g_track": mean_gt,
+                 "mean_g_correct": mean_gc,
+                 "gradient_ratio": (mean_gc / mean_gt) if mean_gt else float("nan")}
+        if "cos_aux" in rows[0]:
+            auxiliary = [row["cos_aux"] for row in rows]
+            pressure = [row["aux_over_track"] for row in rows]
+            entry.update({
+                "mean_cos_aux_weighted": sum(auxiliary) / len(auxiliary),
+                "min_cos_aux_weighted": min(auxiliary),
+                "mean_aux_over_track": sum(pressure) / len(pressure),
+                "segments_cos_aux": segments(rows, "cos_aux"),
+                "segments_aux_over_track": segments(rows, "aux_over_track"),
+                # the two conditions that together mean "the auxiliary objective is actively
+                # pushing the shared weights against tracking": opposed AND loud
+                "fraction_opposed_and_loud": (sum(1 for c, p in zip(auxiliary, pressure)
+                                                  if c < 0.0 and p > 1.0) / len(rows)),
+            })
+        else:
+            entry["mean_cos_aux_weighted"] = None
+            entry["warning"] = ("log predates the weighted diagnostic; the unweighted pair "
+                                "cannot separate 'repair is ineffective' from 'repair is harmful'")
+        report[label] = entry
+        aux_text = (f"{entry['mean_cos_aux_weighted']:>15.3f} "
+                    f"{entry['mean_aux_over_track']:>10.3f}"
+                    if entry["mean_cos_aux_weighted"] is not None else f"{'n/a':>15} {'n/a':>10}")
         print(f"{label:<6} {len(rows):>4} {mean_cos:>9.3f} {min(cos):>8.3f} {max(cos):>8.3f} "
-              f"{mean_gt:>14.3f} {mean_gc:>16.3f} {report[label]['gradient_ratio']:>7.3f}")
+              f"{mean_gt:>14.3f} {mean_gc:>16.3f} {entry['gradient_ratio']:>7.3f} {aux_text}")
+        if entry.get("segments_cos_aux"):
+            print(f"{'':<6} cos(g_track, g_aux) by third of the run: "
+                  + "  ".join(f"{value:+.3f}" for value in entry["segments_cos_aux"])
+                  + f"   opposed-and-loud fraction {entry['fraction_opposed_and_loud']:.2f}")
     print("\ncos < 0 means the tracking and correction losses pull the shared weights apart; the "
-          "gradient ratio says how loud the correction term is relative to tracking.")
+          "gradient ratio says how loud the correction term is relative to tracking.  "
+          "cos(g_track, g_aux) is the weighted reading the optimiser actually sees -- a positive "
+          "unweighted cosine does not rule out an opposed, loud auxiliary objective.")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

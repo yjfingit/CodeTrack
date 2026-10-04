@@ -127,6 +127,14 @@ class CodeTrack(nn.Module):
                                        output_mode=str(get("decoder_output", "post_norm")),
                                        residual_clip=float(get("residual_clip", 0.0)),
                                        gate_always_one=bool(get("gate_always_one", False)),
+                                       # Which state the rounds read: "recurrent" (default,
+                                       # pre-073c223 semantics: each round reads the state the
+                                       # previous round produced) or "held" (every round reads
+                                       # the decoder input; what 073c223 accidentally did to the
+                                       # post_norm/mlp/spatial paths).  The P2 arms A and B were
+                                       # trained under "held" and need the override to be
+                                       # reproducible; see docs/results.md 6.27.
+                                       state_mode=str(get("decoder_state_mode", "recurrent")),
                                        locality_window=int(get("h_locality_window", 0)),
                                        free_edge_frac=float(get("h_free_edge_frac", 0.25)),
                                        locality_wrap=bool(get("h_locality_wrap", True)),

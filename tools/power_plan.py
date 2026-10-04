@@ -84,36 +84,70 @@ def holm_rejected(p_values: np.ndarray, alpha: float = 0.05) -> set:
 
 
 def simulate_power(differences: np.ndarray, effect: float, comparisons: int, sequences: int,
-                   reps: int = 2000, alpha: float = 0.05, seed: int = 0) -> Dict[str, float]:
+                   reps: int = 2000, alpha: float = 0.05, seed: int = 0,
+                   correlation: str = "shared") -> Dict[str, float]:
     """Monte-Carlo power under the actual Holm procedure and the *measured* variance.
 
     ``differences`` are the observed per-sequence effects; the simulation resamples them
     (bootstrap-style, mean-centred) so no normality or variance assumption is added, shifts the
     target comparison to ``effect``, leaves the rest of the family at zero, and applies Holm
-    exactly as the final analysis will.  With ``effect = 0`` the same routine estimates the
-    family-wise error rate, which is the check that the procedure is being applied correctly.
+    exactly as the final analysis will.
+
+    Two corrections to the first version, both of which made the reported numbers optimistic:
+
+    * **FWER means "any rejection in the family", not "the target was rejected".**  The old code
+      checked ``0 in holm_rejected(...)``, so the ``effect = 0`` row estimated the *per-hypothesis*
+      type-I rate (roughly alpha) rather than the family-wise error rate it claimed to report.
+    * **Comparisons share the same sequences.**  The old code drew an independent sample for every
+      comparison, which destroys the positive correlation between condition contrasts measured on
+      the same sequences -- a family of highly correlated tests is rejected much less often than a
+      family of independent ones, so the independent draw made the family look more powerful (and
+      the FWER look worse) than it is.  ``correlation="independent"`` keeps the old behaviour
+      available for comparison only.
     """
     values = np.asarray(differences, dtype=float)
-    if values.size < 2:
+    if values.ndim == 1:
+        # One measured contrast.  The other members of the family are then modelled as *perfectly
+        # correlated* with it (same resample, no shift), which is the conservative end of the
+        # range: Holm's threshold applies to the family's smallest p-value, so perfectly
+        # dependent null tests are rejected least often.  Passing an (m x n) array instead lets
+        # each comparison carry its own measured per-sequence effect, which is the realistic
+        # middle ground and what a real family looks like.
+        values = np.tile(values[None, :], (max(1, comparisons), 1))
+    if values.ndim != 2 or values.shape[1] < 2:
         return {"power": float("nan"), "n_sequences": sequences, "comparisons": comparisons,
                 "effect_points": float(effect), "reps": reps}
-    centred = values - values.mean()
+    if values.shape[0] < comparisons:
+        values = np.tile(values[:1], (comparisons, 1))
+    comparisons = min(comparisons, values.shape[0])
+    if correlation not in ("shared", "independent"):
+        raise ValueError(f"unknown correlation mode {correlation!r}")
+    centred = values[:comparisons] - values[:comparisons].mean(axis=1, keepdims=True)
     rng = np.random.default_rng(seed)
     target_rejections = 0
+    any_rejections = 0
     for _ in range(reps):
+        shared = rng.integers(0, centred.shape[1], size=sequences)
         p_values = np.empty(comparisons, dtype=float)
         for index in range(comparisons):
             shift = float(effect) if index == 0 else 0.0
-            sample = centred[rng.integers(0, centred.size, size=sequences)] + shift
+            draw = (shared if correlation == "shared"
+                    else rng.integers(0, centred.shape[1], size=sequences))
+            sample = centred[index][draw] + shift
             if np.allclose(sample, sample[0]):
                 p_values[index] = 1.0
             else:
                 p_values[index] = float(stats.ttest_1samp(sample, 0.0).pvalue)
-        if 0 in holm_rejected(p_values, alpha):
+        rejected = holm_rejected(p_values, alpha)
+        if rejected:
+            any_rejections += 1
+        if 0 in rejected:
             target_rejections += 1
     return {"power": target_rejections / reps, "n_sequences": sequences,
             "comparisons": comparisons, "effect_points": float(effect), "reps": reps,
-            "alpha": alpha}
+            "alpha": alpha, "correlation": correlation,
+            # Under effect = 0 this is the family-wise error rate: P(at least one rejection).
+            "family_wise_rejection_rate": any_rejections / reps}
 
 
 def main() -> int:
@@ -144,6 +178,11 @@ def main() -> int:
                              "the family-wise error rate")
     parser.add_argument("--families", default="1,4,8",
                         help="Holm family sizes to simulate (condition comparisons + interactions)")
+    parser.add_argument("--correlation", default="shared", choices=["shared", "independent"],
+                        help="'shared' resamples one sequence set per repetition and reuses it for "
+                             "every comparison in the family, which is how the real analysis "
+                             "behaves (all contrasts are measured on the same sequences); "
+                             "'independent' reproduces the old, overly optimistic draw")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -242,19 +281,27 @@ def main() -> int:
         families = [int(value) for value in args.families.split(",") if value.strip()]
         grid = []
         print(f"\nMonte-Carlo power on {len(shared)} measured per-sequence differences "
-              f"({unit}); {args.reps} repetitions per cell, the real Holm step-down")
+              f"({unit}); {args.reps} repetitions per cell, the real Holm step-down, "
+              f"correlation={args.correlation}")
         header = "  ".join(f"m={m:<3}" for m in families)
         print(f"{'effect':>8}  {header}")
         for effect in effects:
             cells = []
             for size in families:
                 result = simulate_power(observed, effect, size, args.sequences, args.reps,
-                                        args.alpha, args.seed)
+                                        args.alpha, args.seed, args.correlation)
                 grid.append(result)
                 cells.append(f"{result['power']:>5.3f}")
             label = "FWER" if effect == 0 else f"{effect:g}"
             print(f"{label:>8}  " + "  ".join(cells))
-        report["simulation"] = {"unit": unit, "grid": grid, "observed": observed.tolist()}
+            if effect == 0:
+                # The row labelled FWER must report P(any rejection), not P(this one rejection);
+                # the two differ by roughly the family size (docs/results.md 6.13).
+                rates = "  ".join(f"{r['family_wise_rejection_rate']:>5.3f}"
+                                  for r in grid[-len(families):])
+                print(f"{'P(any)':>8}  {rates}")
+        report["simulation"] = {"unit": unit, "grid": grid, "observed": observed.tolist(),
+                                "correlation": args.correlation}
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

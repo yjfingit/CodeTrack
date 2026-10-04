@@ -230,15 +230,28 @@ def test_detect_loss_mask_target_is_the_default_and_uses_the_binary_mask():
 
 
 def test_crop_box_for_frame_switches_to_the_reference_trajectory():
-    """P3: a supplied reference trajectory drives the crop, not the run's own prediction."""
+    """P3: a supplied reference trajectory drives the crop, not the run's own prediction.
+
+    The reference is applied **lagged**: the free loop crops frame ``f`` around the box produced
+    for ``f - 1``, never around its own output for ``f``.  Passing ``reference[f]`` (the first
+    version) gave the replay a crop the free run never saw and leaked the reference's answer one
+    frame early, which is also why the TIR replay of 6.12 has to be re-run.
+    """
     predicted = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
-    reference = np.array([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=np.float32)
+    reference = np.array([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0],
+                          [9.0, 10.0, 11.0, 12.0]], dtype=np.float32)
 
     free = crop_box_for_frame(predicted, None, 1)
     replayed = crop_box_for_frame(predicted, reference, 1)
+    later = crop_box_for_frame(predicted, reference, 2)
+    first = crop_box_for_frame(predicted, reference, 0)
 
     assert np.array_equal(free, predicted)
-    assert np.array_equal(replayed, reference[1])
+    assert np.array_equal(replayed, reference[0])          # frame 1 <- reference[0]
+    assert np.array_equal(later, reference[1])             # frame 2 <- reference[1]
+    # frame 0 is driven by the annotation-derived initial box in every arm, so the schedule must
+    # not override it: that was the other half of the misalignment
+    assert np.array_equal(first, predicted)
     assert replayed.dtype == np.float32
     # the helper must not mutate the prediction it was handed
     assert np.array_equal(predicted, np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32))
@@ -486,25 +499,48 @@ def test_crop_square_bounds_a_diverged_window():
 
 def test_clamp_box_bounds_scale_position_and_non_finite_values():
     """The tracker loop must never propagate a box the crop code cannot handle."""
-    keep, flagged = clamp_box(np.array([10.0, 20.0, 60.0, 80.0], dtype=np.float32), 640, 480)
-    assert not flagged
+    keep, reasons = clamp_box(np.array([10.0, 20.0, 60.0, 80.0], dtype=np.float32), 640, 480)
+    assert not reasons
     assert np.allclose(keep, [10.0, 20.0, 60.0, 80.0])
 
-    huge, flagged = clamp_box(np.array([10.0, 20.0, 99999.0, 99999.0], dtype=np.float32),
+    huge, reasons = clamp_box(np.array([10.0, 20.0, 99999.0, 99999.0], dtype=np.float32),
                               640, 480)
-    assert flagged
+    assert reasons
     assert huge[2] <= 4.0 * 640 and huge[3] <= 4.0 * 480
     # the centre is pulled back onto the frame, so the padded window stays bounded
     assert 0.0 <= huge[0] + huge[2] / 2 <= 640.0
     assert 0.0 <= huge[1] + huge[3] / 2 <= 480.0
 
-    centred, flagged = clamp_box(np.array([np.nan, 0.0, 10.0, 10.0], dtype=np.float32),
+    centred, reasons = clamp_box(np.array([np.nan, 0.0, 10.0, 10.0], dtype=np.float32),
                                  640, 480)
-    assert flagged and np.all(np.isfinite(centred))
+    assert reasons and np.all(np.isfinite(centred))
     assert np.allclose(centred, [160.0, 120.0, 320.0, 240.0])
 
-    tiny, flagged = clamp_box(np.array([10.0, 10.0, 0.0, -5.0], dtype=np.float32), 640, 480)
-    assert flagged and tiny[2] > 0 and tiny[3] > 0
+    tiny, reasons = clamp_box(np.array([10.0, 10.0, 0.0, -5.0], dtype=np.float32), 640, 480)
+    assert reasons and tiny[2] > 0 and tiny[3] > 0
+
+
+def test_clamp_box_separates_scale_from_centre_and_nonfinite_events():
+    """A single "clamped" counter mixed four different events.  "87 % of frames clamped" then
+    reads as "87 % diverged" when most of those may be centre clamps, which are a much weaker
+    event.  The reasons must be separable so a divergence claim can name what it measured."""
+    from codetrack.engine.trainer import (CLAMP_CENTER, CLAMP_NONFINITE, CLAMP_NONPOSITIVE,
+                                          CLAMP_SCALE)
+
+    # x chosen so the *post-clamp* centre lands exactly on the frame edge: this isolates the
+    # scale event from the centre event, which the old single flag could not distinguish.
+    _, reasons = clamp_box(np.array([-1280.0, 20.0, 99999.0, 80.0], dtype=np.float32), 640, 480)
+    assert reasons == {CLAMP_SCALE}, "a width blow-up must not be reported as a centre clamp"
+
+    # A small box entirely outside the frame is clamped, but not because it grew.
+    _, reasons = clamp_box(np.array([-500.0, -500.0, 20.0, 20.0], dtype=np.float32), 640, 480)
+    assert reasons == {CLAMP_CENTER}
+
+    _, reasons = clamp_box(np.array([1.0, 2.0, 0.0, 5.0], dtype=np.float32), 640, 480)
+    assert reasons == {CLAMP_NONPOSITIVE}
+
+    _, reasons = clamp_box(np.array([np.inf, 0.0, 10.0, 10.0], dtype=np.float32), 640, 480)
+    assert reasons == {CLAMP_NONFINITE}
 
 
 def test_divergence_rate_reads_the_clamp_counters():
@@ -562,6 +598,86 @@ def test_simulated_power_is_monotone_and_controls_the_family_wise_error():
 
     more = simulate_power(differences, 1.5, comparisons=8, sequences=600, reps=400, seed=2)
     assert more["power"] > family_penalty["power"]
+
+
+def test_simulated_fwer_counts_any_rejection_in_the_family():
+    """The old code checked ``0 in holm_rejected(...)``, so the row labelled FWER reported
+    P(this hypothesis is rejected) -- roughly alpha -- instead of P(any rejection).  Under a null
+    family of 8 the two differ by a large factor, and the number feeds the "can this design ever
+    detect anything" argument of 6.13, so it has to be the family-wise quantity."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from power_plan import simulate_power
+
+    rng = np.random.default_rng(3)
+    differences = rng.normal(0.0, 4.0, size=60)
+
+    null = simulate_power(differences, 0.0, comparisons=8, sequences=60, reps=600, seed=5)
+    per_hypothesis = null["power"]
+    family_wise = null["family_wise_rejection_rate"]
+
+    assert family_wise >= per_hypothesis, \
+        "P(any rejection) cannot be below P(a specific rejection)"
+    # Holm still controls the family-wise rate; with one shared vector the null comparisons are
+    # perfectly dependent, so the control is conservative rather than tight.  Conservative is the
+    # honest direction to be wrong in for a "can this design ever detect anything" number.
+    assert family_wise <= 0.05
+    # the old independent draw is what inflated the family-wise rate
+    independent = simulate_power(differences, 0.0, comparisons=8, sequences=60, reps=600,
+                                 seed=5, correlation="independent")
+    assert independent["family_wise_rejection_rate"] > family_wise
+
+    # A realistic family carries one measured vector per comparison; the shared resample then
+    # preserves the real correlation instead of collapsing the family to one test.
+    family = np.vstack([differences, 0.8 * differences + rng.normal(0, 1.0, size=60)])
+    joint = simulate_power(family, 0.0, comparisons=2, sequences=60, reps=600, seed=5)
+    assert joint["comparisons"] == 2 and joint["family_wise_rejection_rate"] <= 0.05
+
+
+def test_rmst_and_confirmed_failure_frame():
+    """Two endpoints the round-2 plan adds: the failure *time* a tracker could act on, and a
+    censoring-aware mean time tracked.  Both are mechanistic secondaries, so they only have to be
+    correct, not significant."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from horizon_probe import failure_confirmed_frame, first_failure, rmst
+
+    iou = np.array([0.9, 0.8, 0.1, 0.1, 0.1, 0.1, 0.9], dtype=float)
+    failure = first_failure(iou, threshold=0.5, patience=3)
+    assert failure == 2, "the reported event time is the *start* of the failing run"
+    assert failure_confirmed_frame(failure, 3) == 4, "knowable only after `patience` frames"
+    assert failure_confirmed_frame(None, 3) is None
+
+    # A sequence that never fails contributes its full horizon, not zero and not the maximum.
+    assert rmst(np.array([200.0, 200.0]), np.array([0.0, 0.0]), 200) == 200.0
+    # An immediate failure at frame 0 leaves no tracked time.
+    assert rmst(np.array([0.0]), np.array([1.0]), 200) == 0.0
+    # One of two sequences failing at frame 50: half the mass survives past 50.
+    value = rmst(np.array([50.0, 200.0]), np.array([1.0, 0.0]), 200)
+    assert abs(value - (50.0 + 0.5 * 150.0)) < 1e-9
+    # tau truncates rather than extrapolating past the observed follow-up
+    assert rmst(np.array([500.0]), np.array([0.0]), 200) == 200.0
+
+
+def test_gradient_conflict_report_reads_both_log_generations():
+    """Logs written before the weighted diagnostic must still parse (they cannot be
+    regenerated), and the report must say that the unweighted pair alone is not enough."""
+    import tempfile
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    import gradient_conflict_report as reporter
+
+    legacy = ("[grad] cos(L_track, L_correct) = +0.092 | |g_track| 0.597 | |g_correct| 0.109\n")
+    weighted = legacy.rstrip("\n") + (" | cos(L_track, g_aux) = -0.310 | |g_aux| 1.204 "
+                                      "| aux/track 2.017 | cos(L_track, g_total) = +0.402\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "train.log"
+        path.write_text(legacy + weighted)
+        rows = reporter.series(path)
+
+    assert len(rows) == 2
+    assert rows[0]["cos"] == 0.092 and "cos_aux" not in rows[0]
+    assert rows[1]["cos_aux"] == -0.310 and rows[1]["aux_over_track"] == 2.017
+    # the segment summary is what separates "harmless early, opposed late"
+    assert reporter.segments(rows, "cos_aux") == [-0.31]
 
 
 def test_reliability_auroc_scores_the_head_the_decoder_actually_multiplies():
@@ -636,8 +752,13 @@ def test_summarizer_prints_the_sign_it_stores(tmp_path, monkeypatch, capsys):
 
 def test_summarizer_composite_is_one_contrast_over_several_conditions(tmp_path, monkeypatch,
                                                                      capsys):
-    """A result measured on several conditions must be reportable as ONE pre-registered
-    contrast: per-sequence mean drop over the conditions, then the difference in differences."""
+    """A result measured on several conditions must be reportable as ONE contrast: per-sequence
+    mean drop over the conditions, then the difference in differences.
+
+    It is *not* part of the Holm family, because the contrast is defined by the conditions named
+    on the command line rather than pre-registered with the primary endpoint.  Section 6.26's
+    "+3.65 points, p = 0.013" came from this path and was read as if it carried the
+    pre-registration of the primary endpoint, so the flag is now stored in the artifact."""
     sys.path.insert(0, str(ROOT / "tools"))
     import summarize_paired_conditions as summarizer
 
@@ -669,7 +790,10 @@ def test_summarizer_composite_is_one_contrast_over_several_conditions(tmp_path, 
     assert abs(row["mean_drop_b"] - 7.5) < 1e-6
     assert abs(row["mean_difference"] + 7.5) < 1e-6           # A degrades MORE here
     assert row["conditions"] == list(conditions) and row["relative"] is False
-    assert "pre-registered composite" in capsys.readouterr().out
+    assert row["in_holm_family"] is False, \
+        "the composite is defined by the command line and must not be folded into the Holm family"
+    printed = capsys.readouterr().out
+    assert "NOT part of the Holm family" in printed
 
 
 def test_summarizer_metric_selection_and_missing_endpoint_tolerance(tmp_path, monkeypatch,
@@ -856,3 +980,31 @@ def test_load_checkpoint_refuses_a_decoder_output_mismatch(tmp_path):
 
         # and the matching model loads cleanly
         assert load_checkpoint(path, CodeTrack(cfg), map_location="cpu")["missing"] is not None
+
+
+def test_load_checkpoint_refuses_a_decoder_state_mode_mismatch(tmp_path):
+    """``decoder_state_mode`` changes the decoder's *function* while leaving every tensor in
+    place, so a mismatched load cannot be detected from the state dict and silently evaluated a
+    different network.  That is what 073c223 did by accident; the guard now makes the choice
+    explicit, and the P2 arms A and B (trained under "held") need the override to be rebuilt."""
+    from codetrack.models.codetrack import CodeTrack
+    from codetrack.utils.checkpoint import save_checkpoint
+
+    base = {
+        "model": {
+            "embed_dim": 64, "depth": 2, "num_heads": 4, "patch_size": 16,
+            "img_size": 64, "template_size": 32, "code_dim": 32, "check_dim": 16,
+            "num_identity_tokens": 4, "num_parity_tokens": 4, "num_variable_nodes": 16,
+            "num_graph_nodes": 8, "bp_iterations": 2, "h_links_per_check": 4,
+            "graph_top_k": 4, "fpn_dim": 16, "return_stages": (0, 1),
+            "head_type": "CENTER", "head_channel": 16, "freeze_backbone": True,
+        }
+    }
+    held_cfg = {"model": {**base["model"], "decoder_state_mode": "held"}}
+    path = tmp_path / "held.pth"
+    save_checkpoint(path, CodeTrack(held_cfg), optimizer=None, epoch=0, cfg=held_cfg)
+
+    with pytest.raises(RuntimeError, match="decoder_state_mode"):
+        load_checkpoint(path, CodeTrack(base), map_location="cpu")
+
+    assert load_checkpoint(path, CodeTrack(held_cfg), map_location="cpu")["missing"] is not None

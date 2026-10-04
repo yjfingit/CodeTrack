@@ -55,6 +55,19 @@ model:
   # (reliability, ||d||) strata changes nothing, so the four-arm grid tests whether it earns
   # its place at all.
   gate_always_one: false
+  # Which state the decoder rounds read.
+  #   recurrent (default) -- round l reads the state round l-1 produced.  This is standard
+  #                          message passing and is the behaviour of every checkpoint trained
+  #                          before commit 073c223.
+  #   held               -- every round reads the decoder's *input*, so the rounds accumulate
+  #                          independent updates computed from the same word instead of
+  #                          composing.  073c223 introduced this silently for the
+  #                          post_norm/mlp/spatial paths; the P2 arms A and B were trained
+  #                          under it, so reproducing them needs
+  #                          --override model.decoder_state_mode=held.
+  # The two differ only when bp_iterations > 1.  See tools/decoder_state_equivalence.py and
+  # docs/results.md 6.27 for the measured difference.
+  decoder_state_mode: recurrent
   h_links_per_check: 24
   # Optional degree-matched support construction for geometry ablations. Off preserves the
   # reference support sampler; on keeps every check row at h_links_per_check and balances

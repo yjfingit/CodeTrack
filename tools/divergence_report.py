@@ -34,6 +34,7 @@ def rates(path: Path) -> List[Dict[str, Optional[float]]]:
         metrics = json.loads(metrics_path.read_text())
         frames = metrics.get("n_frames")
         clamped = metrics.get("n_box_clamped_frames")
+        by_reason = metrics.get("n_box_clamps_by_reason") or {}
         if frames is None or clamped is None:
             # reconstruct from the per-sequence rows when only those were recorded
             per_sequence = metrics.get("per_sequence") or []
@@ -49,6 +50,11 @@ def rates(path: Path) -> List[Dict[str, Optional[float]]]:
             "frames": int(frames),
             "clamped": int(clamped),
             "divergence_rate": (float(clamped) / float(frames)) if frames else None,
+            # Only the *scale* reason means the prediction grew without bound.  A centre clamp is
+            # a much weaker event that the old single counter reported identically, so a
+            # divergence claim has to name which one it counted (docs/results.md 6.15).
+            "scale_rate": (float(by_reason.get("scale", 0)) / float(frames)) if frames else None,
+            "clamps_by_reason": by_reason or None,
             # the worst sequence is often the interesting one: a single diverged sequence can
             # dominate a mean IoU or SR number without showing up in the run-level rate
             "worst_sequence": max(
@@ -78,16 +84,21 @@ def main() -> int:
         total_clamped = sum(row["clamped"] for row in known)
         overall = (total_clamped / total_frames) if total_frames else float("nan")
         print(f"\n=== {label} ({directory}) ===")
-        print(f"{'condition':<28} {'frames':>8} {'clamped':>8} {'rate':>8}  worst sequence")
+        print(f"{'condition':<28} {'frames':>8} {'clamped':>8} {'rate':>8} {'scale rate':>11}  "
+              f"worst sequence")
         for row in rows:
             if row["divergence_rate"] is None:
-                print(f"{row['condition']:<28} {'-':>8} {'-':>8} {'unknown':>8}  "
+                print(f"{row['condition']:<28} {'-':>8} {'-':>8} {'unknown':>8} {'-':>11}  "
                       f"(counter not recorded)")
                 continue
+            scale = ("-" if row.get("scale_rate") is None
+                     else f"{row['scale_rate'] * 100:.2f}%")
             print(f"{row['condition']:<28} {row['frames']:>8} {row['clamped']:>8} "
-                  f"{row['divergence_rate'] * 100:>7.2f}%  {row['worst_sequence']}")
+                  f"{row['divergence_rate'] * 100:>7.2f}% {scale:>11}  {row['worst_sequence']}")
         print(f"{'ALL conditions with counters':<28} {total_frames:>8} {total_clamped:>8} "
               f"{overall * 100:>7.2f}%")
+        print("'scale rate' counts only the unbounded-growth clamp; runs recorded before the "
+              "breakdown existed report '-' and their 'rate' mixes all four reasons.")
         print(f"{len(rows) - len(known)} of {len(rows)} conditions have no counter "
               f"(recorded before the fix); their frames may include unclamped diverged crops.")
 

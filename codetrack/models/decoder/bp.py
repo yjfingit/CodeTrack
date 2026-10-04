@@ -31,7 +31,7 @@ class NeuralBPDecoder(nn.Module):
                  links_per_check: int = 32, min_column_degree: int = 2,
                  mode: str = "bp", mlp_hidden: int = 0,
                  output_mode: str = "post_norm", residual_clip: float = 0.0,
-                 gate_always_one: bool = False,
+                 gate_always_one: bool = False, state_mode: str = "recurrent",
                  locality_window: int = 0, free_edge_frac: float = 0.25,
                  locality_wrap: bool = True, weight_init: str = "learned",
                  balance_degrees: bool = False,
@@ -202,6 +202,27 @@ class NeuralBPDecoder(nn.Module):
             raise ValueError(f"unknown decoder output_mode {output_mode!r}")
         self.residual_clip = float(residual_clip)
         self.gate_always_one = bool(gate_always_one)
+
+        # ---- iteration state semantics ------------------------------------------
+        # Which state the message/update functions read on round ``l > 1``:
+        #
+        #   "recurrent" (default, and the pre-``073c223`` behaviour): each round reads the
+        #       state updated by the previous round -- standard message passing, so the
+        #       iterations actually compose.
+        #   "held": the branch input stays fixed at the decoder's *input* for every round, so
+        #       the rounds only accumulate independent updates computed from the same word.
+        #
+        # ``073c223`` introduced "held" *silently* for every non-identity output mode: the
+        # loop refreshed the branch input only when ``identity_residual`` was active.  That
+        # changed the semantics of the shipped ``post_norm``/``mlp``/``spatial`` paths while
+        # the commit was described as leaving the default path bit-identical, so arms trained
+        # before it were evaluated under a decoder other than the one they were trained with.
+        # The mode is now explicit and recorded in the checkpoint guard; see
+        # ``tools/decoder_state_equivalence.py`` for the measured size of the difference.
+        self.state_mode = str(state_mode)
+        if self.state_mode not in ("recurrent", "held"):
+            raise ValueError(f"unknown decoder state_mode {state_mode!r}")
+
         # Counts steps whose update came out non-finite and were replaced by zero.  A plain int,
         # not a buffer: a buffer would add a key to the state dict and make every existing
         # checkpoint unloadable.  The identity-residual arms train an un-normalised residual sum
@@ -357,6 +378,7 @@ class NeuralBPDecoder(nn.Module):
         gate_full = torch.cat([gate_r, gate_t], dim=0).unsqueeze(-1)
         total_delta = torch.zeros_like(v)
         identity_output = self.output_mode == "identity_residual"
+        recurrent = self.state_mode == "recurrent"
         branch_input = self.branch_norm(v) if identity_output else v
 
         if self.mode in ("mlp", "spatial"):
@@ -374,9 +396,10 @@ class NeuralBPDecoder(nn.Module):
                 delta = (1.0 - r) * gate_full * delta
                 v = v + delta
                 total_delta = total_delta + delta
-                if identity_output:
-                    # pre-norm branch: the next step reads the normalised *current* state
-                    branch_input = self.branch_norm(v)
+                if recurrent:
+                    # the next round reads the current state (normalised on the branch when the
+                    # output is an un-normalised residual sum)
+                    branch_input = self.branch_norm(v) if identity_output else v
             return self._finish(v, total_delta, variables_rgb, variables_tir, b,
                                 identity_output)
 
@@ -404,8 +427,10 @@ class NeuralBPDecoder(nn.Module):
             delta = (1.0 - r) * gate_full * delta
             v = v + delta
             total_delta = total_delta + delta
-            if identity_output:
-                branch_input = self.branch_norm(v)
+            if recurrent:
+                # the next round reads the current state (normalised on the branch when the
+                # output is an un-normalised residual sum)
+                branch_input = self.branch_norm(v) if identity_output else v
 
         return self._finish(v, total_delta, variables_rgb, variables_tir, b,
                             identity_output)

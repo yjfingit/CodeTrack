@@ -6,7 +6,53 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Decoder iteration state is now explicit** (`model.decoder_state_mode`: `recurrent` default,
+  `held` optional). `073c223` had silently frozen the branch input for every non-identity output
+  mode, so `post_norm`/`mlp`/`spatial` changed *function* from round 2 on while the commit and
+  `docs/results.md` described the default path as bit-identical. `recurrent` restores the
+  pre-`073c223` loop exactly; `load_checkpoint` now refuses a state-mode mismatch like it already
+  did for `decoder_output` and `gate_always_one`. Measured by
+  `tools/decoder_state_equivalence.py` (`docs/results.md` 6.27.1).
+- **The fixed-crop reference was misaligned by one frame.** The free loop crops frame *f* around
+  the box from *f − 1*; passing `reference[f]` showed the replay a crop the free run never saw and
+  leaked the reference's answer a frame early. `crop_box_for_frame` now lags the schedule and keeps
+  frame 0 annotation-driven. Every fixed-crop result, including the TIR reading of 6.12, is
+  provisional until re-run.
+- **`power_plan.py` reported the wrong probability as "FWER"**: it counted P(this hypothesis
+  rejected) rather than P(any rejection in the family), and drew an independent sample per
+  comparison, discarding the correlation between contrasts measured on the same sequences. Now
+  `family_wise_rejection_rate` with one shared resample (or an (m × n) effect matrix). 6.13's power
+  figures are superseded.
+- `clamp_box` now returns *why* a prediction was clamped (scale / centre / non-positive /
+  non-finite) instead of one boolean, and the evaluator stores the breakdown per sequence and per
+  run. Only the scale reason means the closed loop grew without bound.
+- `tools/step_size_probe.py` reports `a_applied/a*`, the actual step-multiplier ratio. The
+  "34x overshoot" of 6.10/6.24 was `L1(applied)/L1(oracle)`, an **error** ratio, and the two are
+  now named separately.
+- `tools/horizon_probe.py` stores `failure_confirmed_frame` (the event is knowable only
+  `patience − 1` frames after its start) and an RMST endpoint, and 6.17.1's "permanently" /
+  "median failure frame 16" wording is corrected to what a 200-frame window can support.
+- `tools/trajectory_replay.py`'s `crop_identical` was `allclose(...) or len(gt) > 0`, i.e. always
+  true; it now compares the crops the loop actually recorded, frame by frame.
+- `tools/summarize_paired_conditions.py` marks every `--composite` result `in_holm_family: false`
+  and says so on stdout; 6.26's "+3.65 points, p = 0.013" came from that path and is exploratory.
+- `tools/gradient_conflict_report.py` reports the **weighted** auxiliary gradient
+  (`cos(g_track, g_aux)`, `‖g_aux‖/‖g_track‖`, by thirds of the run, opposed-and-loud fraction), not
+  only the unweighted `cos(L_track, L_correct)`, which cannot separate "repair is ineffective" from
+  "repair is harmful". `LossOutput` now exposes the graph-connected copies of every weighted term.
+
 ### Added
+- `codetrack/utils/provenance.py` and `run_provenance.json` per training run / `eval_provenance` +
+  `train_provenance` per evaluation manifest: commit, dirty flag, decoder function switches, active
+  parameter count, peak memory. `tools/run_provenance_audit.py` reports which existing numbers can
+  be attributed to a commit (first run: 76 runs, 0 comparable -- the schema is new, so the round-2
+  numbers must be produced again rather than extended).
+- `tools/decoder_state_equivalence.py` -- measures `recurrent` vs `held` vs an independently written
+  pre-`073c223` loop, and asserts `recurrent` reproduces the parent bit for bit.
+- `docs/results.md` 6.27 -- the round-2 truth-fix record, the provenance audit, and the
+  pre-registration for the round-2 experiments (primary contrast, m = 1, 3-point minimum useful
+  effect, RMST as a mechanistic secondary, and what counts as exploratory).
 - Initial repository skeleton: package layout, configs, docs, scripts, tests.
 - Architecture documentation with tensor shapes (`docs/architecture.md`).
 - `tools/git-hooks/post-commit` — background auto-push to `origin`, installed by

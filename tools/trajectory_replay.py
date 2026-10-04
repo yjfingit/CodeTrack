@@ -232,6 +232,17 @@ def main() -> int:
         replay = run_arm(sequence=sequence, max_frames=args.frames,
                          corruption=corruption, collect=False, fixed_boxes=reference)
         head = args.single_step_frames
+        # Did the replay actually see the same crops as the free run?  This is the assumption the
+        # whole fixed-crop comparison rests on, so it is measured from the crops the loop recorded
+        # rather than assumed.  The first version compared frame-0 *predictions* and ORed in
+        # ``len(gt) > 0``, which made it true for every non-empty sequence and hid a one-frame
+        # misalignment of the reference schedule (see crop_box_for_frame).
+        free_crops, replay_crops = free.get("crops"), replay.get("crops")
+        matched_frames = 0
+        if free_crops is not None and replay_crops is not None and len(free_crops):
+            common = min(len(free_crops), len(replay_crops))
+            matched_frames = int(np.all(np.isclose(free_crops[:common], replay_crops[:common],
+                                                   atol=1e-6), axis=1).sum())
         row = {
             "sequence": sequence,
             "interventions": {},
@@ -243,8 +254,13 @@ def main() -> int:
             "clean_single_step": float(_box_iou(reference[:head], gt[:head]).mean()),
             "free_single_step": float(_box_iou(free["pred"][:head], gt[:head]).mean()),
             "fixed_crop_single_step": float(_box_iou(replay["pred"][:head], gt[:head]).mean()),
-            "crop_identical": bool(np.allclose(free["pred"][:1], replay["pred"][:1], atol=1e-6)
-                                   or len(gt) > 0),
+            # frame 0 only: every arm starts from the same annotation-driven crop, so this must be
+            # true and a failure means the replay is not the comparison it claims to be
+            "crop_identical": bool(
+                free_crops is not None and replay_crops is not None and len(free_crops)
+                and np.allclose(free_crops[0], replay_crops[0], atol=1e-6)),
+            # how far the closed loops have diverged: frames whose crops still agree
+            "crop_identical_frames": matched_frames,
         }
         if args.recovery:
             detail = {}

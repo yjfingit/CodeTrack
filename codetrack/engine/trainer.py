@@ -57,31 +57,48 @@ def plan_corruption(cfg_corruption: Dict[str, Any], corruption: Optional[Dict[st
 MAX_BOX_SCALE = 4.0
 
 
+#: Why a prediction had to be pulled back onto the frame.  A single "clamped" counter mixed four
+#: very different events: an unbounded *scale* explosion (the closed loop diverging), a
+#: centre that walked off the frame, a non-positive size, and a non-finite prediction.  Reporting
+#: "87 % of frames were clamped" without this breakdown reads as "87 % diverged", which is not
+#: what the counter measured (docs/results.md 6.15).
+CLAMP_SCALE = "scale"
+CLAMP_CENTER = "center"
+CLAMP_NONPOSITIVE = "nonpositive"
+CLAMP_NONFINITE = "nonfinite"
+CLAMP_REASONS = (CLAMP_SCALE, CLAMP_CENTER, CLAMP_NONPOSITIVE, CLAMP_NONFINITE)
+
+
 def clamp_box(box: np.ndarray, width: int, height: int,
               max_scale: float = MAX_BOX_SCALE) -> tuple:
     """Keep a predicted box finite, positive and at most ``max_scale`` times the frame.
 
-    Returns ``(box, clamped)``.  A non-finite prediction is replaced by a centred half-frame box
-    rather than being propagated, and an off-frame centre is pulled back onto the frame, so the
-    next crop is always bounded.
+    Returns ``(box, reasons)`` where ``reasons`` is the set (possibly empty) of
+    :data:`CLAMP_REASONS` that fired.  ``bool(reasons)`` is the old ``clamped`` flag, so callers
+    that only need "was it touched" are unchanged; callers that report divergence should use the
+    breakdown, because only ``CLAMP_SCALE`` means the loop grew without bound.
     """
+    reasons: set = set()
     value = np.asarray(box, dtype=np.float32)
     if not np.all(np.isfinite(value)):
+        reasons.add(CLAMP_NONFINITE)
         return (np.array([width * 0.25, height * 0.25, width * 0.5, height * 0.5],
-                         dtype=np.float32), True)
+                         dtype=np.float32), reasons)
     x, y, w, h = (float(v) for v in value)
-    clamped = False
     if w <= 0 or h <= 0:
-        w, h, clamped = max(w, 2.0), max(h, 2.0), True
+        w, h = max(w, 2.0), max(h, 2.0)
+        reasons.add(CLAMP_NONPOSITIVE)
     if w > max_scale * width:
-        w, clamped = max_scale * width, True
+        w = max_scale * width
+        reasons.add(CLAMP_SCALE)
     if h > max_scale * height:
-        h, clamped = max_scale * height, True
+        h = max_scale * height
+        reasons.add(CLAMP_SCALE)
     cx, cy = x + w / 2.0, y + h / 2.0
     ccx, ccy = min(max(cx, 0.0), float(width)), min(max(cy, 0.0), float(height))
     if ccx != cx or ccy != cy:
-        clamped = True
-    return np.array([ccx - w / 2.0, ccy - h / 2.0, w, h], dtype=np.float32), clamped
+        reasons.add(CLAMP_CENTER)
+    return np.array([ccx - w / 2.0, ccy - h / 2.0, w, h], dtype=np.float32), reasons
 
 
 def crop_box_for_frame(predicted: np.ndarray, fixed_boxes: Optional[np.ndarray],
@@ -90,10 +107,22 @@ def crop_box_for_frame(predicted: np.ndarray, fixed_boxes: Optional[np.ndarray],
 
     ``fixed_boxes`` (a reference trajectory) makes every condition see identical crops, which
     is what separates "this frame was harder" from "the closed loop diverged earlier".
+
+    The reference is applied **lagged by one frame**, because the free loop crops frame ``f``
+    around the box produced for frame ``f - 1`` (and around the frame-0 annotation for ``f == 0``)
+    -- never around its own output for frame ``f``.  Passing ``reference[f]`` instead, as the
+    first version of this function did, gave the replay a crop the free run never saw and handed
+    it the reference's answer one frame early; frame 0 in particular was cropped around the model's
+    *prediction* rather than the annotation, so the runs did not even start from the same crop.
+    ``tools/trajectory_replay.py``'s ``crop_identical`` check was writtten to catch exactly that
+    and could not, because its condition was ``or len(gt) > 0``.
     """
     if fixed_boxes is None:
         return predicted
-    return np.asarray(fixed_boxes[index], dtype=np.float32)
+    if index <= 0:
+        # frame 0 is driven by the initial box in every arm, fixed schedule or not
+        return predicted
+    return np.asarray(fixed_boxes[index - 1], dtype=np.float32)
 
 
 class Trainer:
@@ -236,12 +265,26 @@ class Trainer:
 
     @torch.enable_grad()
     def _gradient_conflict(self, inputs, target, corruption) -> Optional[Dict[str, float]]:
-        """Cosine between the tracking and the correction gradients.
+        """Is the tracking objective fighting the *weighted* auxiliary objective?
 
         ``L_correct`` pulls the features back towards the clean codeword while ``L_track``
         only needs the box to be right; if the two gradients are consistently opposed the
         correction branch is being fought by the tracking objective rather than helped.
-        Measured on the blocks the two losses actually share.
+
+        The first version reported ``cos(L_track, L_correct)`` only -- one unweighted pair, on
+        three modules, with no notion of how hard the auxiliary terms actually push.  But the
+        optimiser sees
+
+            g = g_track + lambda_detect * g_detect + lambda_correct * g_correct
+                       + lambda_preserve * g_preserve + lambda_gain * g_gain
+                       + lambda_identity * g_identity
+
+        so a positive cosine between two *unweighted* terms says little about whether the
+        combined auxiliary gradient opposes tracking, and nothing about its magnitude.  With
+        ``lambda_correct = 2.0`` and ``lambda_preserve = 0.5`` the auxiliary side can dominate
+        ``g_track`` while ``L_correct`` alone looks harmless, which is exactly the
+        "repair is harmful rather than merely ineffective" hypothesis that has to be
+        distinguishable (docs/results.md 6.27).  Both readings are therefore reported.
         """
         watched = ("decoder", "codebook", "reliability")
         params = [p for n, p in self.model.named_parameters()
@@ -277,14 +320,45 @@ class Trainer:
             # no correction path exists, so there is no conflict to report
             return None
 
+        # The auxiliary terms, weighted exactly as the optimiser sees them.
+        weighted = (("detect", self.loss_fn.lambda_detect),
+                    ("correct", self.loss_fn.lambda_correct),
+                    ("preserve", self.loss_fn.lambda_preserve),
+                    ("gain", self.loss_fn.lambda_gain),
+                    ("identity", self.loss_fn.lambda_identity))
+        active = [(key, weight) for key, weight in weighted if float(weight) != 0.0]
+
         g_track = grads("track", retain_graph=True)
-        g_correct = grads("correct", retain_graph=False)
-        if g_track is None or g_correct is None:
+        if g_track is None:
             return None
-        cos = torch.nn.functional.cosine_similarity(g_track, g_correct, dim=0)
-        return {"grad_cos_track_correct": float(cos),
-                "grad_norm_track": float(g_track.norm()),
-                "grad_norm_correct": float(g_correct.norm())}
+        terms: Dict[str, torch.Tensor] = {}
+        for position, (key, _) in enumerate(active):
+            last = position == len(active) - 1
+            value = grads(key, retain_graph=not last)
+            if value is not None:
+                terms[key] = value
+        if not terms:
+            return None
+        g_aux = torch.zeros_like(g_track)
+        for key, weight in active:
+            if key in terms:
+                g_aux = g_aux + float(weight) * terms[key]
+
+        diag: Dict[str, float] = {}
+        # Unweighted pair, kept so the existing log parser and every archived log stay readable.
+        if "correct" in terms:
+            diag["grad_cos_track_correct"] = float(
+                torch.nn.functional.cosine_similarity(g_track, terms["correct"], dim=0))
+            diag["grad_norm_track"] = float(g_track.norm())
+            diag["grad_norm_correct"] = float(terms["correct"].norm())
+        # The quantity that actually drives the shared weights.
+        diag["grad_cos_track_aux_weighted"] = float(
+            torch.nn.functional.cosine_similarity(g_track, g_aux, dim=0))
+        diag["grad_norm_aux_weighted"] = float(g_aux.norm())
+        diag["grad_aux_over_track"] = float(g_aux.norm() / g_track.norm().clamp(min=1e-12))
+        diag["grad_cos_weighted_total"] = float(torch.nn.functional.cosine_similarity(
+            g_track, g_track + g_aux, dim=0))
+        return diag
 
     # ------------------------------------------------------------------- train
     def train(self, max_iters: Optional[int] = None) -> Dict[str, Any]:
@@ -341,11 +415,21 @@ class Trainer:
                 if self.grad_diag_every and step % self.grad_diag_every == 0:
                     diag = self._gradient_conflict(inputs, target, corruption)
                     if diag:
-                        self.logger.info(
-                            "[grad] cos(L_track, L_correct) = %+.3f | |g_track| %.3f "
-                            "| |g_correct| %.3f",
-                            diag["grad_cos_track_correct"], diag["grad_norm_track"],
-                            diag["grad_norm_correct"])
+                        # The legacy prefix is kept verbatim so archived logs stay parseable; the
+                        # weighted reading is appended, because the unweighted pair alone cannot
+                        # distinguish "repair is ineffective" from "repair is harmful".
+                        message = ("[grad] cos(L_track, L_correct) = %+.3f | |g_track| %.3f "
+                                   "| |g_correct| %.3f")
+                        values = [diag["grad_cos_track_correct"], diag["grad_norm_track"],
+                                  diag["grad_norm_correct"]]
+                        if "grad_cos_track_aux_weighted" in diag:
+                            message += (" | cos(L_track, g_aux) = %+.3f | |g_aux| %.3f "
+                                        "| aux/track %.3f | cos(L_track, g_total) = %+.3f")
+                            values += [diag["grad_cos_track_aux_weighted"],
+                                       diag["grad_norm_aux_weighted"],
+                                       diag["grad_aux_over_track"],
+                                       diag["grad_cos_weighted_total"]]
+                        self.logger.info(message, *values)
                 nonfinite = int(outputs.get("decoder_nonfinite_steps", 0) or 0)
                 if nonfinite and nonfinite != getattr(self, "_nonfinite_reported", 0):
                     self._nonfinite_reported = nonfinite
@@ -451,7 +535,11 @@ class Trainer:
 
         prev = g0.copy()
         preds, gts = [], []
+        # The box that actually drove each frame's crop.  Returned so a fixed-crop replay can
+        # *verify* that it saw the same crops instead of asserting it in a comment.
+        crops_used: List[np.ndarray] = []
         box_clamps = 0
+        box_clamps_by_reason = {reason: 0 for reason in CLAMP_REASONS}
         frame_h, frame_w = rgb0.shape[:2]
 
         img_cfg, token_cfg, rng, identity_mode = plan_corruption(
@@ -481,6 +569,7 @@ class Trainer:
                 rgb, tir = apply_image_corruption(rgb, tir, img_cfg, rng)
 
             crop = crop_box_for_frame(prev, fixed_boxes, f)
+            crops_used.append(crop.astype(np.float32).copy())
             cx, cy = crop[0] + crop[2] / 2, crop[1] + crop[3] / 2
             side = float(np.sqrt(max(crop[2], 1) * max(crop[3], 1))) * sf
             search_rgb = self._crop_resize(rgb, cx, cy, side, search_size)
@@ -523,9 +612,11 @@ class Trainer:
             py = cy + (box[1] - 0.5) * side
             pw, ph = box[2] * side, box[3] * side
             prediction = np.array([px - pw / 2, py - ph / 2, pw, ph], dtype=np.float32)
-            prediction, was_clamped = clamp_box(prediction, frame_w, frame_h)
-            if was_clamped:
+            prediction, clamp_reasons = clamp_box(prediction, frame_w, frame_h)
+            if clamp_reasons:
                 box_clamps += 1
+                for reason in clamp_reasons:
+                    box_clamps_by_reason[reason] += 1
             if fixed_boxes is None:
                 # free-running: this run's own prediction drives the next crop
                 prev = prediction
@@ -534,12 +625,19 @@ class Trainer:
             gts.append(gt.copy())
 
         result: Dict[str, Any] = {"pred": np.asarray(preds), "gt": np.asarray(gts),
-                                  "box_clamps": box_clamps}
+                                  "crops": (np.asarray(crops_used) if crops_used
+                                            else np.zeros((0, 4), dtype=np.float32)),
+                                  "box_clamps": box_clamps,
+                                  "box_clamps_by_reason": box_clamps_by_reason}
         if box_clamps:
             # Visible, not silent: a frame whose box had to be pulled back is a frame where the
-            # closed loop diverged, and that is part of reading the metrics.
-            self.logger.info("%s: %d/%d frames had the predicted box clamped",
-                             seq, box_clamps, len(preds))
+            # closed loop diverged, and that is part of reading the metrics.  The breakdown
+            # matters: only CLAMP_SCALE means the prediction grew without bound, while a centre
+            # clamp is a much weaker event that the old single counter reported identically.
+            detail = ", ".join(f"{reason}={count}"
+                               for reason, count in box_clamps_by_reason.items() if count)
+            self.logger.info("%s: %d/%d frames had the predicted box clamped (%s)",
+                             seq, box_clamps, len(preds), detail)
         if collect:
             result["diagnostics"] = diag
         return result
@@ -689,6 +787,8 @@ class Trainer:
                 # SR number there describes a broken loop rather than a repair failure.
                 "frames": int(len(r["pred"])),
                 "box_clamps": int(r.get("box_clamps", 0)),
+                "box_clamps_by_reason": {reason: int(count) for reason, count
+                                         in (r.get("box_clamps_by_reason") or {}).items()},
                 "sr": success_auc(r["pred"], r["gt"]),
                 "pr": precision_at(r["pred"], r["gt"], 20.0),
                 "npr": normalized_precision(r["pred"], r["gt"], 0.2),
@@ -721,15 +821,25 @@ class Trainer:
         summary["n_sequences"] = len(results)
         summary["n_box_clamped_frames"] = int(sum(m.get("box_clamps", 0)
                                                   for m in sequence_metrics))
+        # The breakdown, so "N frames clamped" cannot be read as "N scaled-up divergences": a
+        # centre clamp is a different (much weaker) event than a scale clamp, and the old single
+        # counter reported both identically (docs/results.md 6.15).
+        summary["n_box_clamps_by_reason"] = {
+            reason: int(sum((m.get("box_clamps_by_reason") or {}).get(reason, 0)
+                            for m in sequence_metrics))
+            for reason in CLAMP_REASONS}
         total_frames = int(sum(m.get("frames", 0) for m in sequence_metrics))
         summary["n_frames"] = total_frames
         summary["divergence_rate"] = (float(summary["n_box_clamped_frames"] / total_frames)
                                       if total_frames else float("nan"))
         if summary["n_box_clamped_frames"]:
+            detail = ", ".join(f"{reason}={count}" for reason, count
+                               in summary["n_box_clamps_by_reason"].items() if count)
             self.logger.warning(
-                "%d frames had their predicted box clamped to the frame bound -- the closed "
-                "loop diverged there (MAX_BOX_SCALE); see docs/results.md 6.15",
-                summary["n_box_clamped_frames"])
+                "%d frames had their predicted box clamped to the frame bound (%s) -- only the "
+                "scale count means the closed loop grew without bound (MAX_BOX_SCALE); see "
+                "docs/results.md 6.15",
+                summary["n_box_clamped_frames"], detail)
         summary["n_requested"] = len(seqs)
         summary["n_skipped"] = len(skipped)
         self.logger.info("evaluation on %d sequences: PR %.2f | SR(AUC) %.2f | NPR %.2f",

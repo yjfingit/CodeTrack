@@ -360,12 +360,24 @@ RGB, ratio 0.2, four corruption families, one of them seen in training and three
   (`docs/results.md` 6.21 corrects an earlier, stronger claim here).
 * **The bounded-step parameterisation is the answer that works, at the geometry level.**  With
   `model.decoder_output="identity_residual"` (section 11.8) the update applies 1.015/1.004x the
-  ideal step and *reduces* the damaged-token error (`gain vs zero` +0.0145/+0.0151), against
-  34-35x overshoot and -5.8 for retrained `post_norm` arms.  It does **not** yet show a robustness
+  ideal step and *reduces* the damaged-token error (`gain vs zero` +0.0145/+0.0151), against a
+  `post_norm` `L1(applied)/L1(oracle)` of 34-35 and -5.8 for the retrained arms.  (That 34 is an
+  **error** ratio, not a step multiplier -- the step ratio `a_applied/a*` is reported separately by
+  `tools/step_size_probe.py`; see `docs/results.md` 6.27.3.)  It does **not** yet show a robustness
   gain in tracking (the pre-registered A-vs-D composite is -0.80 SR points, CI [-5.11, +3.40],
-  `docs/results.md` 6.24), and it costs closed-loop stability (1.5-1.7 % of frames clamped against
-  0.00-0.14 %), but the arm that combines it with the learned gate is the best tracker of the four
-  (0.385 clean SR against 0.339 shipped).
+  `docs/results.md` 6.24 -- and note that A-vs-D is a contrast between two correction
+  configurations, not a module switch), and it costs closed-loop stability (1.5-1.7 % of frames
+  clamped against 0.00-0.14 %), but the arm that combines it with the learned gate is the best
+  tracker of the four (0.385 clean SR against 0.339 shipped).
+* **The decoder's iteration state is an explicit switch**: `model.decoder_state_mode` is
+  `recurrent` (default; round *l* reads the state round *l-1* produced -- the pre-`073c223`
+  behaviour and standard message passing) or `held` (every round reads the decoder input).
+  `073c223` applied `held` silently to every non-identity output mode, which changed the function
+  while leaving the state dict untouched; `tools/decoder_state_equivalence.py` measures the
+  difference (max abs 0.08-0.24 at unit scale for 2-3 rounds) and confirms `recurrent` reproduces
+  the parent loop bit for bit.  `load_checkpoint` refuses a mismatch, and the two P2 `post_norm`
+  arms need `--override model.decoder_state_mode=held` to be rebuilt (`docs/results.md` 6.27.1).
+  This is the one parameterisation detail that is invisible in a checkpoint and changes results.
 * **The severity gate is not a damage detector** (permutation effect <= 0.001 in every arm) but it
   is not decoration either: training with it forced to 1 lands 4.40 clean points lower in the
   `post_norm` parameterisation and 10.76 points lower in the identity-residual one
@@ -487,6 +499,18 @@ re-simulates the backbone: the teacher is the **same frozen backbone's** clean t
 corruption is applied to feature tokens *after* the backbone. The task is feature-space
 denoising, and `L_gain` is what forces the decoder to actually use the redundancy instead of
 learning the identity.
+
+**Correction (results.md 6.27.3): the teacher is token-clean, not image-clean.**  Image-level
+corruption is applied in the dataset, to the search frame, before the backbone
+(`docs/corruption_protocol.md`), so `clean_tokens` -- `feats["x_r"]` in
+`codetrack/models/codetrack.py` -- is the backbone's output on an **already degraded** image with
+only the token-level erasure removed.  The denoising target is therefore "recover the token
+representation of a degraded frame from its further-erased version", a strictly narrower task than
+"recover the clean frame's representation".  Every `recovery_gain` / `damage_clean` number in
+`docs/results.md` inherits that scope, and a repair that helps background tokens, or tokens in the
+teacher's already-degraded frame, need not help foreground localisation.  A genuinely image-clean
+teacher would need a second forward pass on the pristine pair; that is not implemented and should
+not be described as if it were.
 
 ### 12.5 Naming
 

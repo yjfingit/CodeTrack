@@ -424,7 +424,14 @@ class CodeTrackLoss(nn.Module):
                  + self.lambda_identity * identity)
         parts["track"] = track.detach()
         parts["loss"] = total
-        # graph-connected copies, used only by the gradient-conflict diagnostic
+        # graph-connected copies, used only by the gradient-conflict diagnostic.  Every weighted
+        # term is exposed, not just L_correct: the optimiser sees their sum, and with
+        # ``lambda_correct = 2.0`` / ``lambda_preserve = 0.5`` the auxiliary side can dominate
+        # ``g_track`` even when ``L_correct`` alone looks benign (docs/results.md 6.27).
         parts["track_graph"] = track
+        parts["detect_graph"] = detect
         parts["correct_graph"] = correct
+        parts["preserve_graph"] = preserve
+        parts["gain_graph"] = gain
+        parts["identity_graph"] = identity
         return parts

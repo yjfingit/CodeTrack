@@ -111,10 +111,10 @@ def main() -> int:
 
     rng = np.random.default_rng(args.seed)
     per_frame: List[Dict[str, float]] = []
-    pooled = {key: [] for key in ("astar", "applied_ratio", "gate_value", "reliability",
-                                 "d_norm", "e_norm", "l1_zero", "l1_applied", "l1_oracle",
-                                 "l1_best_global", "l1_gate_permuted", "l1_grid_best",
-                                 "l1_oracle_postnorm", "l1_applied_postnorm")}
+    pooled = {key: [] for key in ("astar", "applied_ratio", "applied_over_astar", "gate_value",
+                                 "reliability", "d_norm", "e_norm", "l1_zero", "l1_applied",
+                                 "l1_oracle", "l1_best_global", "l1_gate_permuted",
+                                 "l1_grid_best", "l1_oracle_postnorm", "l1_applied_postnorm")}
     frames_done = 0
 
     for plan in plans:
@@ -186,6 +186,17 @@ def main() -> int:
                 full_grid[nodes[0].long()] = learned_gate[0].float()
                 gate_value = full_grid[damaged]
             applied_ratio = applied.norm(dim=-1) / d_norm.clamp(min=1e-8)
+            # The multiplier the decoder actually applied *along d*, and its ratio to the oracle
+            # multiplier.  This -- not ``applied_ratio`` above -- is the quantity an "overshoot"
+            # claim is about: ``||applied|| / ||d||`` coincides with it only under --single-step,
+            # and ``L1(applied)/L1(oracle)`` (what tools/compare_step_probes.py prints) is an
+            # error ratio again.  Both were read as "the step is 34x too large", which is why the
+            # three are now reported next to each other with distinct names.
+            a_applied = (applied * d).sum(dim=-1) / denominator
+            ratio_valid = astar > 1e-6
+            applied_over_astar = torch.where(
+                ratio_valid, a_applied / astar.clamp(min=1e-12),
+                torch.full_like(astar, float("nan")))
             # diagnostics of the gate's own distribution: the median over *all* damaged
             # tokens mixes selected (learned value) and unselected (neutral 1) entries
             selected_mask = torch.zeros(n_tok, dtype=torch.bool, device=damaged.device)
@@ -231,6 +242,9 @@ def main() -> int:
                 "astar_median": float(astar[finite].median()),
                 "astar_zero_fraction": float((astar[finite] <= 1e-6).float().mean()),
                 "applied_ratio_median": float(applied_ratio.median()),
+                "a_applied_median": float(a_applied.median()),
+                "applied_over_astar_median": float(torch.nanmedian(applied_over_astar)),
+                "applied_over_astar_valid_fraction": float(ratio_valid.float().mean()),
                 "gate_median": float(gate_value.median()),
                 "gate_selected_mean": gate_selected_mean,
                 "selected_fraction_damaged": float(selected_damaged.float().mean()),
@@ -245,6 +259,7 @@ def main() -> int:
             per_frame.append(row)
             pooled["astar"].append(astar[finite].cpu().numpy())
             pooled["applied_ratio"].append(applied_ratio.cpu().numpy())
+            pooled["applied_over_astar"].append(applied_over_astar.cpu().numpy())
             pooled["gate_value"].append(gate_value.cpu().numpy())
             pooled["reliability"].append(reliability.cpu().numpy())
             pooled["d_norm"].append(d_norm.cpu().numpy())
@@ -281,6 +296,14 @@ def main() -> int:
         "astar_zero_fraction": float(np.mean(astar_all <= 1e-6)) if astar_all.size else float("nan"),
         "applied_ratio_to_d_median": float(np.median(stack("applied_ratio")))
         if stack("applied_ratio").size else float("nan"),
+        # The three numbers that used to be conflated: ||applied||/||d|| (a step, but not the
+        # step along d under multi-round BP), a_applied/a* (the actual overshoot factor), and
+        # L1(applied)/L1(oracle) (an error ratio, reported by compare_step_probes).
+        "applied_over_astar_median": float(np.nanmedian(stack("applied_over_astar")))
+        if stack("applied_over_astar").size else float("nan"),
+        "applied_over_astar_quartiles": [
+            float(v) for v in np.nanquantile(stack("applied_over_astar"), [0.25, 0.5, 0.75])]
+        if stack("applied_over_astar").size else [],
         "gate_median": float(np.median(gate_all)) if gate_all.size else float("nan"),
         "gate_selected_mean": float(np.nanmean([r["gate_selected_mean"] for r in per_frame]))
         if per_frame else float("nan"),
@@ -308,12 +331,14 @@ def main() -> int:
           f"gate median={summary['gate_median']:.3f} "
           f"(selected mean {summary['gate_selected_mean']:.3f}, "
           f"selected frac {summary['selected_fraction_damaged']:.3f}) "
-          f"(applied/||d|| median={summary['applied_ratio_to_d_median']:.3f}) | "
+          f"(applied/||d|| median={summary['applied_ratio_to_d_median']:.3f}, "
+          f"a_applied/a* median={summary['applied_over_astar_median']:.3f}) | "
           f"rho(gate, a*)={summary['gate_astar_spearman']:+.3f}")
     print(f"L1 on damaged tokens: zero={mean_l1['l1_zero']:.4f} "
           f"applied={mean_l1['l1_applied']:.4f} oracle={mean_l1['l1_oracle']:.4f} "
           f"best-global={mean_l1['l1_best_global']:.4f} "
-          f"gate-permuted={mean_l1['l1_gate_permuted']:.4f}")
+          f"gate-permuted={mean_l1['l1_gate_permuted']:.4f} | "
+          f"L1(applied)/L1(oracle)={mean_l1['l1_applied'] / mean_l1['l1_oracle']:.3f}")
     return 0
 
 
