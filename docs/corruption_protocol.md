@@ -140,3 +140,22 @@ no-decoder checkpoint should lose roughly 20-40 % relative SR against clean at t
 level while keeping about 60-80 % of its clean SR; the drop must show a paired sequence-level
 interval that excludes zero; and the whole curve is reported rather than the single level that
 happens to favour one arm.
+
+### 6.1 Two splits: v1 (60, the published tables) and v2 (150, the pre-registered design)
+
+`tools/select_validation_sequences.py` can extend an existing split (`--include`), so the larger
+split is a **strict superset** of the smaller one and the two stay comparable on the shared
+sequences:
+
+* `outputs/validation_split_v1/` -- 60 sequences, 12 per stratum.  Every table in
+  `docs/results.md` sections 6.5-6.16 was measured on this split; it is kept for reproducibility.
+* `outputs/validation_split_v2/` -- 150 sequences, `--include` v1 plus 90 more
+  (low illumination 38, thermal crossover 37, total occlusion 20, partial occlusion 37,
+  unoccluded 18; the small strata are exhausted before the large ones).  All 60 v1 sequences are
+  inside it, so a v2 run can be reported both at n = 150 and at the v1 subset.
+
+The reason for the second split is measured, not aesthetic: at n = 60 the primary contrast (the
+decoder-vs-branch-off difference in differences on `rgb_occl_04`) has an MDE of 4.75 SR points
+and a 3-point effect would need ~151 sequences; at n = 150 that effect becomes detectable at
+80 % power.  A 1-point effect needs > 1300 sequences and is out of reach by design, so any
+campaign on v2 must state its minimum detectable effect up front (`docs/results.md` 6.13, 6.17).

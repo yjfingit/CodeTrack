@@ -305,6 +305,19 @@ neighbourhood it watches, reconstructed from the **trusted template** rather tha
 possibly corrupted search frame.  The static `16x16` generator (`SparseParityGenerator`)
 was removed rather than left as dead code.
 
+> **Caveat on "trusted" (added 2026-10-03, not yet measured).** The claim above is about the
+> *corrupted token view*, and it holds there: token corruption is applied after the backbone,
+> so `parity` never sees a masked token.  It is **not** a claim that the template is
+> independent of the current search frame.  `SharedViTBackbone.forward_stream` concatenates
+> `[z, x]` and runs joint self-attention, so `z_r`/`z_t` -- and therefore the identity tokens
+> and the parity reference -- were computed with full attention to the *clean* search frame of
+> the current timestep.  A check comparing a corrupted observation against a reference that
+> already encodes the clean answer is a clean-vs-corrupted comparison, not an
+> external-consistency check, and it is a live shortcut for exactly the corruption family this
+> work trains on.  Whether the model exploits it is an open measurement: compare this backbone
+> with a variant whose template stream cannot attend to the search tokens, or score how much
+> clean-search information `parity` carries.
+
 `obs` is computed on the **modality-averaged** code-space projection,
 `0.5 * (to_code(x_r) + to_code(x_t))`, so damage in either modality enters the syndrome
 directly instead of only through the graph construction.
@@ -328,6 +341,35 @@ anyway".  Two additions close that gap.
 | `locator_recall_at_k` | corrupted tokens present in the top-k. Reported for continuity, but its **ceiling is `k / n_corrupted`** (~0.098 at k=5, 20% corruption, 256 tokens), so it must be read against that, not against 1.0 | `k / N` |
 | `recovery_gain` | `(E_before - E_after) / E_before`, **on corrupted tokens only** | 0 |
 | `damage_clean` | error on the untouched tokens, i.e. how much the repair disturbs healthy code | 0 |
+| `reliability_auroc_rgb` / `_tir` | AUROC of the reliability head's `1 - r` against the **token** mask, per modality (the coefficient the decoder actually multiplies) | 0.5 |
+
+**Measured status of those two claims** (`docs/results.md` 6.7.1; 8 sequences x 40 frames,
+RGB, ratio 0.2, four corruption families, one of them seen in training and three held out):
+
+* `reliability_auroc_rgb` = **1.0000 on every zeroing family**, seen or not, and **0.7440 on a
+  held-out non-zeroing family**.  The head is a zero-token detector that generalises over mask
+  geometry but not over corruption mechanism, so any degradation-detection claim has to be scored
+  on a non-zeroing family.
+* `syndrome_auroc` = **0.345-0.499**, i.e. at or below chance on every family: the syndrome does
+  not detect damage.  The Tanner path's measured contribution is localization-by-contiguity
+  (`locator_precision_at_5` 0.84/0.78 for contiguous damage, 0.31/0.21 for scattered, chance
+  ~0.2), not damage detection.
+* `recovery_gain`: **-0.02** on the zeroing families under *rgb-only* erasure and **-0.88** on the
+  held-out non-zeroing family, but **+0.055** under the training configuration (both modalities
+  erased) -- the branch repairs the mechanism it was trained on and nothing else
+  (`docs/results.md` 6.21 corrects an earlier, stronger claim here).
+* **The bounded-step parameterisation is the answer that works, at the geometry level.**  With
+  `model.decoder_output="identity_residual"` (section 11.8) the update applies 1.015/1.004x the
+  ideal step and *reduces* the damaged-token error (`gain vs zero` +0.0145/+0.0151), against
+  34-35x overshoot and -5.8 for retrained `post_norm` arms.  It does **not** yet show a robustness
+  gain in tracking (the pre-registered A-vs-D composite is -0.80 SR points, CI [-5.11, +3.40],
+  `docs/results.md` 6.24), and it costs closed-loop stability (1.5-1.7 % of frames clamped against
+  0.00-0.14 %), but the arm that combines it with the learned gate is the best tracker of the four
+  (0.385 clean SR against 0.339 shipped).
+* **The severity gate is not a damage detector** (permutation effect <= 0.001 in every arm) but it
+  is not decoration either: training with it forced to 1 lands 4.40 clean points lower in the
+  `post_norm` parameterisation and 10.76 points lower in the identity-residual one
+  (`docs/results.md` 6.24).  Section 11.6's gate is a training-time conditioner.
 
 Two of these had to be fixed because the metric itself was wrong, not the model:
 
@@ -492,6 +534,13 @@ erasure, or that burst erasure is the only recoverable condition. Re-measure wit
 and held-out sequences. `tools/syndrome_fit.py` measures the syndrome against a constant
 baseline; `tools/recovery_probe.py` separately measures feature recovery.
 
+**Status of that re-measurement.**  Done: `syndrome_use_obs_energy=false` (the default), exact
+corruption masks, and held-out *families* on held-out test sequences (four families, results.md
+6.7.1).  Still pending: matched realized support degrees across geometries, and a family that
+varies the *magnitude* of the damage rather than its mechanism.  The measured outcome so far is
+in the metrics table above: the syndrome is at or below chance and the reliability head is a
+zeroing-mechanism detector.
+
 Feature noise, zero erasure, and energy-matched replacement produce different observable
 signals. Keep them as distinct protocols and do not infer performance in one from another.
 
@@ -533,6 +582,9 @@ circular distance so the window wraps instead of biasing the frame edge) and sti
 which `k` of those to keep through `softplus(H)`; `h_free_edge_frac` of its edges stay
 unrestricted so a check can still reach across the frame when locality is the wrong bias.
 
-The claim stays **"learned sparse H under a geometric prior"**. It is deliberately not a
-hand-designed convolution neighbourhood: the edges are still learned, only the candidate set
-is restricted.
+The claim is **"learned edge weights on a fixed, geometrically constructed sparse support"**.
+It is deliberately not a hand-designed convolution neighbourhood, and it is also not a
+*learned support*: which variable a check watches is decided by the constructor (locality
+window, degree balancing, minimum column degree) and `softplus(H) * H_support` cannot create
+an edge outside that support. Earlier wording said "learned sparse H", which overstated what
+is learned.

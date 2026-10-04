@@ -15,13 +15,85 @@ from torch.utils.data import DataLoader
 
 from ..data.datasets import build_dataset
 from ..data.corruption.corruption import CorruptionConfig, apply_image_corruption
-from ..metrics import normalized_precision, precision_at, success_auc, summarize
+from ..metrics import (_box_iou, normalized_precision, precision_at, success_auc,
+                       summarize)
 from .evaluator import summarize_detection, summarize_recovery, summarize_hinge
 from ..models.codetrack import CodeTrack
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
 from ..utils.logging import get_logger
 from ..utils.seed import set_seed
 from .losses import CodeTrackLoss
+
+
+def plan_corruption(cfg_corruption: Dict[str, Any], corruption: Optional[Dict[str, Any]]
+                    ) -> tuple:
+    """Resolve one evaluation condition into ``(img_cfg, token_cfg, rng, identity_mode)``.
+
+    ``corruption["mode"] == "identity"`` is the **strict no-op control**: diagnostics stay
+    enabled but no image-level degradation, no token mask and -- crucially -- **no RNG draw**
+    happens, so the frame stream, the masks and every later random number match the clean run
+    bit for bit.  ``ratio = 0`` is *not* a no-op: ``corrupt_tokens`` clamps to one erased
+    token per frame, which can still move a response peak and therefore the whole closed-loop
+    trajectory.
+
+    Extracted from ``infer_sequence`` so the plan is testable without a model or a dataset.
+    """
+    if not corruption:
+        return None, None, None, False
+    if str(corruption.get("mode", "")).lower() == "identity":
+        return None, None, None, True
+    merged = {**cfg_corruption, **corruption}
+    img_cfg = CorruptionConfig.from_dict(merged)
+    rng = np.random.default_rng(int(img_cfg.seed or 0))
+    token_cfg = ({"enabled": True, "token": img_cfg.token,
+                  "ratio": img_cfg.ratio, "severity": img_cfg.severity,
+                  "target": merged.get("target", "both")}
+                 if img_cfg.token else None)
+    return img_cfg, token_cfg, rng, False
+
+
+# A tracked box larger than this multiple of the frame means the loop has diverged; letting it
+# through is what turns one bad frame into an unbounded crop (see MAX_CROP_SIDE_FACTOR).
+MAX_BOX_SCALE = 4.0
+
+
+def clamp_box(box: np.ndarray, width: int, height: int,
+              max_scale: float = MAX_BOX_SCALE) -> tuple:
+    """Keep a predicted box finite, positive and at most ``max_scale`` times the frame.
+
+    Returns ``(box, clamped)``.  A non-finite prediction is replaced by a centred half-frame box
+    rather than being propagated, and an off-frame centre is pulled back onto the frame, so the
+    next crop is always bounded.
+    """
+    value = np.asarray(box, dtype=np.float32)
+    if not np.all(np.isfinite(value)):
+        return (np.array([width * 0.25, height * 0.25, width * 0.5, height * 0.5],
+                         dtype=np.float32), True)
+    x, y, w, h = (float(v) for v in value)
+    clamped = False
+    if w <= 0 or h <= 0:
+        w, h, clamped = max(w, 2.0), max(h, 2.0), True
+    if w > max_scale * width:
+        w, clamped = max_scale * width, True
+    if h > max_scale * height:
+        h, clamped = max_scale * height, True
+    cx, cy = x + w / 2.0, y + h / 2.0
+    ccx, ccy = min(max(cx, 0.0), float(width)), min(max(cy, 0.0), float(height))
+    if ccx != cx or ccy != cy:
+        clamped = True
+    return np.array([ccx - w / 2.0, ccy - h / 2.0, w, h], dtype=np.float32), clamped
+
+
+def crop_box_for_frame(predicted: np.ndarray, fixed_boxes: Optional[np.ndarray],
+                       index: int) -> np.ndarray:
+    """Which box drives the search crop of frame ``index``.
+
+    ``fixed_boxes`` (a reference trajectory) makes every condition see identical crops, which
+    is what separates "this frame was harder" from "the closed loop diverged earlier".
+    """
+    if fixed_boxes is None:
+        return predicted
+    return np.asarray(fixed_boxes[index], dtype=np.float32)
 
 
 class Trainer:
@@ -72,6 +144,11 @@ class Trainer:
             detect_reliability=float(loss_cfg.get("detect_reliability", 1.0)),
             detect_syndrome=float(loss_cfg.get("detect_syndrome", 1.0)),
             detect_localize=float(loss_cfg.get("detect_localize", 1.0)),
+            # "mask" (shipped) supervises the detection heads with the injected corruption
+            # mask; "deviation" supervises the continuous feature deviation from the frozen
+            # teacher instead, which is definable for degradation families that have no mask.
+            detect_target=str(loss_cfg.get("detect_target", "mask")),
+            detect_deviation_cm=float(loss_cfg.get("detect_deviation_cm", 0.2)),
             num_parity=self.model.num_parity,
             dim=self.model.dim,
             code_dim=self.model.code_dim,
@@ -269,6 +346,12 @@ class Trainer:
                             "| |g_correct| %.3f",
                             diag["grad_cos_track_correct"], diag["grad_norm_track"],
                             diag["grad_norm_correct"])
+                nonfinite = int(outputs.get("decoder_nonfinite_steps", 0) or 0)
+                if nonfinite and nonfinite != getattr(self, "_nonfinite_reported", 0):
+                    self._nonfinite_reported = nonfinite
+                    self.logger.warning(
+                        "decoder replaced %d non-finite update(s) with zero so far "
+                        "(fp16 overflow in the un-normalised residual path?)", nonfinite)
                 if step % self.log_every == 0 or step == 1:
                     mem = (torch.cuda.max_memory_allocated() / 2**20
                            if self.device.type == "cuda" else 0)
@@ -316,12 +399,25 @@ class Trainer:
     def infer_sequence(self, root: Path, subset: str, seq: str,
                        max_frames: Optional[int] = None,
                        corruption: Optional[Dict[str, Any]] = None,
-                       collect: bool = False) -> Dict[str, Any]:
+                       collect: bool = False,
+                       fixed_boxes: Optional[np.ndarray] = None,
+                       forward_fn=None) -> Dict[str, Any]:
         """Run the tracker over one sequence.
 
         With ``corruption`` the frames are degraded (image level + token level) exactly as
         during training, and with ``collect`` the per-frame error-correction diagnostics
         are accumulated alongside the boxes.
+
+        ``fixed_boxes`` replays a *reference* trajectory: frame ``f`` is cropped around
+        ``fixed_boxes[f]`` instead of around this run's own previous prediction, so every
+        condition sees exactly the same crops and a per-frame difference is the model's
+        response to that frame rather than the closed loop having diverged earlier.  The
+        returned ``pred`` still holds this run's own predictions.
+
+        ``forward_fn`` replaces the model call of the *corrupted* pass with a callable of the
+        same signature.  That is how ``tools/trajectory_replay.py`` injects path substitutions
+        (clean reliability and gates, or clean TIR tokens into the fusion) into the tracker loop
+        without duplicating the loop; ``None`` keeps the plain model call.
         """
         rgb_frames = self._sequence_frames(root, subset, seq, "visible")
         tir_frames = self._sequence_frames(root, subset, seq, "infrared")
@@ -355,21 +451,20 @@ class Trainer:
 
         prev = g0.copy()
         preds, gts = [], []
+        box_clamps = 0
+        frame_h, frame_w = rgb0.shape[:2]
 
-        img_cfg = None
-        token_cfg = None
-        rng = None
-        if corruption:
-            merged = {**self.cfg.get("corruption", {}), **corruption}
-            img_cfg = CorruptionConfig.from_dict(merged)
-            rng = np.random.default_rng(int(img_cfg.seed or 0))
-            token_cfg = ({"enabled": True, "token": img_cfg.token,
-                          "ratio": img_cfg.ratio, "severity": img_cfg.severity,
-                          "target": merged.get("target", "both")}
-                         if img_cfg.token else None)
+        img_cfg, token_cfg, rng, identity_mode = plan_corruption(
+            self.cfg.get("corruption", {}) or {}, corruption)
+        if identity_mode:
+            # strict no-op control: diagnostics on, corruption off, RNG untouched
+            self.logger.info("%s: identity corruption (diagnostics=%s, no RNG draw)",
+                             seq, collect)
 
         diag = {"syndrome": [], "syndrome_y": [], "syndrome_density": [], "syndrome_clean": [],
                 "locator": [], "locator_y": [],
+                "reliability_rgb": [], "reliability_y_rgb": [],
+                "reliability_tir": [], "reliability_y_tir": [],
                 "e_before": [], "e_after": [], "e_clean": [],
                 "rec_e_before": [], "rec_e_after": [], "rec_hinge": [], "rec_active": []}
 
@@ -385,19 +480,21 @@ class Trainer:
             if img_cfg is not None:
                 rgb, tir = apply_image_corruption(rgb, tir, img_cfg, rng)
 
-            cx, cy = prev[0] + prev[2] / 2, prev[1] + prev[3] / 2
-            side = float(np.sqrt(max(prev[2], 1) * max(prev[3], 1))) * sf
+            crop = crop_box_for_frame(prev, fixed_boxes, f)
+            cx, cy = crop[0] + crop[2] / 2, crop[1] + crop[3] / 2
+            side = float(np.sqrt(max(crop[2], 1) * max(crop[3], 1))) * sf
             search_rgb = self._crop_resize(rgb, cx, cy, side, search_size)
             search_tir = self._crop_resize(tir, cx, cy, side, search_size)
 
             s_rgb = to_tensor(search_rgb, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             s_tir = to_tensor(search_tir, 1, (0.449,), (0.226,))
 
-            out = self.model(tpl_rgb_t.unsqueeze(0).to(self.device),
-                             s_rgb.unsqueeze(0).to(self.device),
-                             tpl_tir_t.unsqueeze(0).to(self.device),
-                             s_tir.unsqueeze(0).to(self.device),
-                             corruption=token_cfg, clean_teacher=bool(collect))
+            call = forward_fn or self.model
+            out = call(tpl_rgb_t.unsqueeze(0).to(self.device),
+                       s_rgb.unsqueeze(0).to(self.device),
+                       tpl_tir_t.unsqueeze(0).to(self.device),
+                       s_tir.unsqueeze(0).to(self.device),
+                       corruption=token_cfg, clean_teacher=bool(collect))
             box = out["bbox"][0].float().cpu().numpy()          # cx, cy, w, h in [0, 1]
 
             if collect:
@@ -425,12 +522,24 @@ class Trainer:
             px = cx + (box[0] - 0.5) * side
             py = cy + (box[1] - 0.5) * side
             pw, ph = box[2] * side, box[3] * side
-            prev = np.array([px - pw / 2, py - ph / 2, pw, ph], dtype=np.float32)
+            prediction = np.array([px - pw / 2, py - ph / 2, pw, ph], dtype=np.float32)
+            prediction, was_clamped = clamp_box(prediction, frame_w, frame_h)
+            if was_clamped:
+                box_clamps += 1
+            if fixed_boxes is None:
+                # free-running: this run's own prediction drives the next crop
+                prev = prediction
 
-            preds.append(prev.copy())
+            preds.append(prediction.copy())
             gts.append(gt.copy())
 
-        result: Dict[str, Any] = {"pred": np.asarray(preds), "gt": np.asarray(gts)}
+        result: Dict[str, Any] = {"pred": np.asarray(preds), "gt": np.asarray(gts),
+                                  "box_clamps": box_clamps}
+        if box_clamps:
+            # Visible, not silent: a frame whose box had to be pulled back is a frame where the
+            # closed loop diverged, and that is part of reading the metrics.
+            self.logger.info("%s: %d/%d frames had the predicted box clamped",
+                             seq, box_clamps, len(preds))
         if collect:
             result["diagnostics"] = diag
         return result
@@ -461,6 +570,17 @@ class Trainer:
             ((support @ mask_any) / degree).float().cpu().numpy())
         diag["locator"].append(out["locator_scattered"][0].float().cpu().numpy())
         diag["locator_y"].append(mask_any.cpu().numpy())
+        # 1 - r is the coefficient the decoder multiplies, so its AUROC against the *token*
+        # mask is the honest version of "does the reliability head know what is damaged".
+        # Per modality, with that modality's own mask as the label.
+        if "reliability_rgb" in out:
+            diag["reliability_rgb"].append(
+                (1.0 - out["reliability_rgb"][0].float()).cpu().numpy())
+            diag["reliability_y_rgb"].append(m_r.cpu().numpy())
+        if "reliability_tir" in out:
+            diag["reliability_tir"].append(
+                (1.0 - out["reliability_tir"][0].float()).cpu().numpy())
+            diag["reliability_y_tir"].append(m_t.cpu().numpy())
 
         if "clean_tokens" in out:
             clean = out["clean_tokens"]
@@ -503,7 +623,8 @@ class Trainer:
                  root: Optional[str] = None,
                  corruption: Optional[Dict[str, Any]] = None,
                  topk: int = 5,
-                 sequence_list: Optional[str] = None) -> Dict[str, float]:
+                 sequence_list: Optional[str] = None,
+                 collect_diagnostics: bool = False) -> Dict[str, float]:
         """Sequence-level PR / SR / NPR, plus the error-correction diagnostics.
 
         With ``corruption`` set, the run also reports syndrome AUROC, localization
@@ -513,6 +634,10 @@ class Trainer:
         ``sequence_list`` names a file with one sequence per line and replaces the subset
         listing.  It defaults to ``None``, so the historical "first N of the subset" path
         (and every number already computed from it) stays bit-identical.
+
+        ``collect_diagnostics`` decouples the per-frame diagnostics pass (and its extra
+        clean-reference forward) from the presence of corruption, which is what makes a
+        strict no-op control possible at all.
         """
         if checkpoint:
             report = load_checkpoint(checkpoint, self.model, map_location=str(self.device))
@@ -548,7 +673,8 @@ class Trainer:
         for i, seq in enumerate(seqs):
             try:
                 r = self.infer_sequence(data_root, subset, seq, max_frames=max_frames,
-                                        corruption=corruption, collect=bool(corruption))
+                                        corruption=corruption,
+                                        collect=bool(corruption) or collect_diagnostics)
             except Exception as exc:                                   # noqa: BLE001
                 self.logger.warning("skip %s: %s", seq, exc)
                 skipped.append(f"{seq}: {exc}")
@@ -557,9 +683,21 @@ class Trainer:
                 skipped.append(f"{seq}: empty prediction")
                 continue
             seq_metrics = {
+                # frames and clamped frames make the *divergence rate* of a condition
+                # reportable next to its metrics: with both modalities erased at 40 % some
+                # sequences spend most frames with the box clipped at the frame bound, and an
+                # SR number there describes a broken loop rather than a repair failure.
+                "frames": int(len(r["pred"])),
+                "box_clamps": int(r.get("box_clamps", 0)),
                 "sr": success_auc(r["pred"], r["gt"]),
                 "pr": precision_at(r["pred"], r["gt"], 20.0),
                 "npr": normalized_precision(r["pred"], r["gt"], 0.2),
+                # Mean frame IoU is stored per sequence on purpose: SR is a thresholded
+                # statistic whose per-sequence variance is large (see docs/results.md 6.13), and
+                # a paired analysis needs a lower-variance endpoint to be powered at all.  It is
+                # an additional endpoint, not a replacement for the pre-registered SR.
+                "iou_mean": float(_box_iou(r["pred"], r["gt"]).mean())
+                if len(r["pred"]) else float("nan"),
             }
             results.append(seq_metrics)
             sequence_metrics.append({"sequence": seq, **seq_metrics})
@@ -570,10 +708,28 @@ class Trainer:
 
         summary = summarize(results)
         summary["per_sequence"] = sequence_metrics
+        iou_values = [m["iou_mean"] for m in sequence_metrics
+                      if np.isfinite(m.get("iou_mean", float("nan")))]
+        if iou_values:
+            # Additional endpoint next to the pre-registered SR: mean frame IoU is not
+            # thresholded, so its per-sequence variance is smaller and a paired claim can be
+            # powered at a realistic sample size (docs/results.md 6.13).
+            summary["iou"] = float(np.mean(iou_values))
         # A silently shortened evaluation is worse than a failed one: metrics computed over
         # half the set look fine and mean nothing.  The valid count is reported explicitly and
         # a large skip rate is surfaced rather than left in the log.
         summary["n_sequences"] = len(results)
+        summary["n_box_clamped_frames"] = int(sum(m.get("box_clamps", 0)
+                                                  for m in sequence_metrics))
+        total_frames = int(sum(m.get("frames", 0) for m in sequence_metrics))
+        summary["n_frames"] = total_frames
+        summary["divergence_rate"] = (float(summary["n_box_clamped_frames"] / total_frames)
+                                      if total_frames else float("nan"))
+        if summary["n_box_clamped_frames"]:
+            self.logger.warning(
+                "%d frames had their predicted box clamped to the frame bound -- the closed "
+                "loop diverged there (MAX_BOX_SCALE); see docs/results.md 6.15",
+                summary["n_box_clamped_frames"])
         summary["n_requested"] = len(seqs)
         summary["n_skipped"] = len(skipped)
         self.logger.info("evaluation on %d sequences: PR %.2f | SR(AUC) %.2f | NPR %.2f",
@@ -589,7 +745,12 @@ class Trainer:
             summary.update(summarize_detection(merged["syndrome"], merged["syndrome_y"],
                                                merged["locator"], merged["locator_y"],
                                                merged.get("syndrome_clean"),
-                                               merged.get("syndrome_density"), topk=topk))
+                                               merged.get("syndrome_density"),
+                                               merged.get("reliability_rgb"),
+                                               merged.get("reliability_y_rgb"),
+                                               merged.get("reliability_tir"),
+                                               merged.get("reliability_y_tir"),
+                                               topk=topk))
             summary.update(summarize_recovery(merged["e_before"], merged["e_after"],
                                               merged["e_clean"]))
             if merged.get("rec_hinge"):

@@ -67,6 +67,10 @@ def main() -> int:
     parser.add_argument("--out", required=True, help="directory for sequences.txt/manifest")
     parser.add_argument("--n", type=int, default=60, help="total sequences to select")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--include", default=None,
+                        help="existing sequences.txt to keep, so a larger split is a strict "
+                             "superset of a smaller one and the two remain comparable on the "
+                             "shared sequences")
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -96,13 +100,21 @@ def main() -> int:
 
     selected: List[str] = []
     chosen: Dict[str, List[str]] = {name: [] for name in STRATA}
+    if args.include:
+        # keep an earlier split verbatim: it becomes the first quota of its own stratum
+        keep = [line.strip() for line in Path(args.include).read_text().splitlines()
+                if line.strip()]
+        for sequence in keep:
+            if sequence in attributes_of:
+                chosen[assign_stratum(attributes_of[sequence])].append(sequence)
+                selected.append(sequence)
     for name in STRATA:
-        candidates = by_stratum[name]
-        take = min(quota, len(candidates))
+        candidates = [s for s in by_stratum[name] if s not in set(chosen[name])]
+        take = min(max(0, quota - len(chosen[name])), len(candidates))
         if take:
             picks = rng.permutation(len(candidates))[:take]
-            chosen[name] = [candidates[i] for i in sorted(picks)]
-            selected.extend(chosen[name])
+            chosen[name].extend(candidates[i] for i in sorted(picks))
+            selected.extend(candidates[i] for i in sorted(picks))
 
     # Fill the remainder round-robin over the strata so the balance is kept even when one
     # stratum is small (low illumination has only ~50 testingset sequences).
@@ -128,6 +140,7 @@ def main() -> int:
     manifest = {
         "root": str(root),
         "subset": args.subset,
+        "included_from": args.include,
         "seed": args.seed,
         "requested": args.n,
         "selected": len(selected),

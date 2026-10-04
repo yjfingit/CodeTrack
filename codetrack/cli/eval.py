@@ -27,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--corrupt", action="store_true",
                    help="evaluate under the corruption protocol and report the "
                         "error-correction diagnostics (AUROC / recall / recovery)")
+    p.add_argument("--corrupt-identity", action="store_true",
+                   help="strict no-op control: diagnostics on, no image or token corruption, "
+                        "no RNG draw (unlike --corrupt-ratio 0, which still erases one token "
+                        "per frame)")
+    p.add_argument("--diagnostics", action="store_true",
+                   help="collect the per-frame diagnostics even without corruption, so the "
+                        "extra clean-reference forward is present in both conditions")
     p.add_argument("--corrupt-token", default=None)
     p.add_argument("--corrupt-rgb", action="append", default=[],
                    choices=["rgb_lowlight", "rgb_overexp", "rgb_occl"])
@@ -50,7 +57,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     corruption = None
-    if args.corrupt:
+    if args.corrupt_identity:
+        corruption = {"enabled": True, "mode": "identity"}
+    elif args.corrupt:
         token_corruptions = [args.corrupt_token] if args.corrupt_token else []
         if not token_corruptions and not args.corrupt_rgb and not args.corrupt_tir \
                 and not args.corrupt_cross_modal:
@@ -70,7 +79,8 @@ def main() -> None:
     summary = trainer.evaluate(checkpoint=args.checkpoint, subset=args.subset,
                                max_sequences=args.max_sequences, max_frames=args.max_frames,
                                root=args.root, corruption=corruption, topk=args.topk,
-                               sequence_list=args.sequence_list)
+                               sequence_list=args.sequence_list,
+                               collect_diagnostics=bool(args.diagnostics))
 
     summary["invocation"] = {
         "config": args.config,
@@ -82,6 +92,7 @@ def main() -> None:
         "max_frames": args.max_frames,
         "root": args.root,
         "corruption": corruption,
+        "collect_diagnostics": bool(args.diagnostics),
         "topk": args.topk,
     }
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))

@@ -30,6 +30,8 @@ class NeuralBPDecoder(nn.Module):
                  num_variables: int = 256, iterations: int = 2,
                  links_per_check: int = 32, min_column_degree: int = 2,
                  mode: str = "bp", mlp_hidden: int = 0,
+                 output_mode: str = "post_norm", residual_clip: float = 0.0,
+                 gate_always_one: bool = False,
                  locality_window: int = 0, free_edge_frac: float = 0.25,
                  locality_wrap: bool = True, weight_init: str = "learned",
                  balance_degrees: bool = False,
@@ -160,8 +162,10 @@ class NeuralBPDecoder(nn.Module):
                               requires_grad=self.learn_weights)
 
         # ---- message functions ---------------------------------------------------
-        # In "mlp" mode none of these exist, otherwise they would be dead parameters and
-        # the baseline would not be parameter-matched.
+        # In "mlp"/"spatial" mode none of these exist, otherwise they would be dead parameters
+        # and the baseline would not be parameter-matched.
+        if mode not in ("bp", "mlp", "spatial", "off"):
+            raise ValueError(f"unknown decoder mode {mode!r}")
         if mode == "bp":
             self.v_msg = nn.Sequential(
                 nn.Linear(dim + 1, dim), nn.GELU(), nn.Linear(dim, dim),
@@ -179,13 +183,46 @@ class NeuralBPDecoder(nn.Module):
         # leaving a learnable LayerNorm in place would let "no decoder" still rescale tokens.
         self.out_norm = nn.LayerNorm(dim) if mode != "off" else None
 
-        # ---- parameter-matched baseline -------------------------------------
-        # "mlp" removes message passing entirely and replaces each BP round with a
-        # residual MLP of matched width.  If this matches the BP decoder, the whole
-        # Tanner-graph story is decoration.
-        # Match the MLP's message-function parameters to the BP message functions.  A
-        # hard-coded width tied to 768 dimensions misses by a large margin on the reference
-        # model and can be worse at smaller test dimensions.
+        # ---- output parameterisation -------------------------------------------
+        # "post_norm" (default) is the shipped behaviour: the update happens in the raw token
+        # space and the *output* is normalised, while ``L_correct`` compares that output
+        # against pre-norm clean features.  The probe in ``tools/step_size_probe.py`` shows
+        # what that costs: the update overshoots the ideal step by 2-10x and the LayerNorm
+        # absorbs the scale, so the optimiser can "fix" the loss by shrinking the update.
+        #
+        # "identity_residual" moves the normalisation *inside* the update branch and leaves the
+        # output un-normalised:
+        #     u  = LN_branch(v)                              (pre-norm on the branch input)
+        #     dv = W_o * f_theta([u, messages]) + b_o        (W_o = 0, b_o = 0 at init)
+        #     v' = v + (1 - r) * gate * C_B(dv)
+        # so the initial output is the input (a true identity path), the reported residual is
+        # the residual that is actually applied, and a bounded step cannot silently overshoot.
+        self.output_mode = str(output_mode)
+        if self.output_mode not in ("post_norm", "identity_residual"):
+            raise ValueError(f"unknown decoder output_mode {output_mode!r}")
+        self.residual_clip = float(residual_clip)
+        self.gate_always_one = bool(gate_always_one)
+        # Counts steps whose update came out non-finite and were replaced by zero.  A plain int,
+        # not a buffer: a buffer would add a key to the state dict and make every existing
+        # checkpoint unloadable.  The identity-residual arms train an un-normalised residual sum
+        # under fp16 autocast, where one overflowing MLP output can turn into inf -> NaN and then
+        # abort the whole run with a device-side assert (the loss then sees a NaN probability and
+        # BCELoss asserts); this makes that an event that is counted and logged instead of fatal.
+        self.nonfinite_steps = 0
+        if mode != "off" and self.output_mode == "identity_residual":
+            self.branch_norm = nn.LayerNorm(dim)
+            self.residual_out = nn.Linear(dim, dim)
+            nn.init.zeros_(self.residual_out.weight)
+            nn.init.zeros_(self.residual_out.bias)
+        else:
+            self.branch_norm = None
+            self.residual_out = None
+
+        # ---- parameter-matched baselines -------------------------------------
+        # "mlp" removes message passing entirely and replaces each BP round with a residual MLP
+        # of matched width; "spatial" additionally gives that MLP a *local* receptive field
+        # (depthwise 3x3 over the token grid) so the comparison separates "Tanner structure" from
+        # "ordinary spatial context".  Both match the BP message-function parameter count.
         if mlp_hidden <= 0:
             def linear_params(in_features: int, out_features: int) -> int:
                 return in_features * out_features + out_features
@@ -199,9 +236,10 @@ class NeuralBPDecoder(nn.Module):
             n_iterations = max(1, iterations)
             mlp_params_per_hidden = n_iterations * (2 * dim + 2)
             mlp_fixed_params = n_iterations * dim
+            spatial_params = (dim * 9 + dim) * n_iterations if mode == "spatial" else 0
             mlp_hidden = max(
                 8,
-                int(round((bp_message_params - mlp_fixed_params) /
+                int(round((bp_message_params - mlp_fixed_params - spatial_params) /
                           mlp_params_per_hidden)),
             )
         self.mlp_blocks = nn.ModuleList([
@@ -209,7 +247,24 @@ class NeuralBPDecoder(nn.Module):
                 nn.Linear(dim + 1, mlp_hidden), nn.GELU(),   # input is [v, r]
                 nn.Linear(mlp_hidden, dim),
             ) for _ in range(iterations)
-        ]) if mode == "mlp" else None
+        ]) if mode in ("mlp", "spatial") else None
+        self.mlp_hidden = mlp_hidden
+
+        # "spatial": a depthwise 3x3 convolution over the (grid x grid) token layout, i.e. the
+        # cheapest possible way to give the mixer the local neighbourhood the Tanner checks are
+        # built from -- without any parity, syndrome or locator quantity.
+        self.grid = int(round(num_variables ** 0.5))
+        if mode == "spatial":
+            if self.grid * self.grid != num_variables:
+                raise ValueError(
+                    f"decoder_mode='spatial' needs a square token grid, got "
+                    f"num_variables={num_variables}")
+            self.spatial_conv = nn.ModuleList([
+                nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+                for _ in range(iterations)
+            ])
+        else:
+            self.spatial_conv = None
 
     # ------------------------------------------------------------------ helpers
     def _h(self) -> torch.Tensor:
@@ -292,25 +347,38 @@ class NeuralBPDecoder(nn.Module):
         r = torch.cat([reliability_rgb, reliability_tir], dim=0).unsqueeze(-1)
         gate_r = self._expand_gate(gate_rgb, node_index, b, v.shape[1], variables_rgb)
         gate_t = self._expand_gate(gate_tir, node_index, b, v.shape[1], variables_tir)
+        if self.gate_always_one:
+            # The learned severity gate is an *extra* attenuator on top of (1 - r);
+            # tools/step_size_probe.py measures that permuting its values within
+            # (reliability, ||d||) strata changes nothing.  This switch removes it so the
+            # four-arm grid can test "is the second gate worth anything at all".
+            gate_r = torch.ones_like(gate_r)
+            gate_t = torch.ones_like(gate_t)
         gate_full = torch.cat([gate_r, gate_t], dim=0).unsqueeze(-1)
         total_delta = torch.zeros_like(v)
+        identity_output = self.output_mode == "identity_residual"
+        branch_input = self.branch_norm(v) if identity_output else v
 
-        if self.mode == "mlp":
-            # no parity-check matrix, no messages: a matched residual denoiser
-            for block in self.mlp_blocks:
-                delta = block(torch.cat([v, r], dim=-1))
+        if self.mode in ("mlp", "spatial"):
+            # no parity-check matrix, no messages, no syndrome: a matched residual denoiser.
+            # "spatial" additionally mixes each token with its 3x3 neighbourhood on the grid.
+            for round_index, block in enumerate(self.mlp_blocks):
+                features = branch_input
+                if self.mode == "spatial":
+                    conv = self.spatial_conv[round_index]
+                    grid = self.grid
+                    maps = features.transpose(1, 2).reshape(-1, self.dim, grid, grid)
+                    mixed = conv(maps).reshape(-1, self.dim, grid * grid).transpose(1, 2)
+                    features = features + mixed
+                delta = self._step(block(torch.cat([features, r], dim=-1)))
                 delta = (1.0 - r) * gate_full * delta
                 v = v + delta
                 total_delta = total_delta + delta
-            pre_norm = v
-            norm_only = self.out_norm(torch.cat([variables_rgb, variables_tir], dim=0))
-            v = self.out_norm(pre_norm)
-            return {
-                "corrected_rgb": v[:b], "corrected_tir": v[b:],
-                "residual_rgb": total_delta[:b], "residual_tir": total_delta[b:],
-                "norm_only_rgb": norm_only[:b], "norm_only_tir": norm_only[b:],
-                "pre_norm_rgb": pre_norm[:b], "pre_norm_tir": pre_norm[b:],
-            }
+                if identity_output:
+                    # pre-norm branch: the next step reads the normalised *current* state
+                    branch_input = self.branch_norm(v)
+            return self._finish(v, total_delta, variables_rgb, variables_tir, b,
+                                identity_output)
 
         # ---- belief propagation ---------------------------------------------------
         h = self._h()                                              # M x N
@@ -323,7 +391,7 @@ class NeuralBPDecoder(nn.Module):
 
         for _ in range(self.iterations):
             # ---- Variable -> Check ------------------------------------------------
-            m_vc_full = self.v_msg(torch.cat([v, r], dim=-1))      # 2B x 256 x 768
+            m_vc_full = self.v_msg(torch.cat([branch_input, r], dim=-1))   # 2B x 256 x 768
             m_vc = torch.einsum("cv,bvd->bcd", h, m_vc_full)       # 2B x 16 x 768
 
             # ---- Check -> Variable ------------------------------------------------
@@ -331,21 +399,65 @@ class NeuralBPDecoder(nn.Module):
             c_out = self.c_msg(c_in)                               # 2B x 16 x 768
             m_cv = torch.einsum("cv,bcd->bvd", h, c_out)           # 2B x 256 x 768
 
-            # ---- Update: v <- v + (1 - r) * gate * delta ---------------------------
-            delta = self.update(torch.cat([v, m_cv], dim=-1))      # 2B x 256 x 768
+            # ---- Update: v <- v + (1 - r) * gate * C_B(delta) ----------------------
+            delta = self._step(self.update(torch.cat([branch_input, m_cv], dim=-1)))
             delta = (1.0 - r) * gate_full * delta
             v = v + delta
             total_delta = total_delta + delta
+            if identity_output:
+                branch_input = self.branch_norm(v)
 
-        # norm-only control: the decoder's output LayerNorm applied to the *uncorrected*
-        # input.  It isolates the pure scale change from the message updates, so a negative
-        # recovery_gain can be attributed (or not) to the Tanner messages.
+        return self._finish(v, total_delta, variables_rgb, variables_tir, b,
+                            identity_output)
+
+    def _step(self, delta: torch.Tensor) -> torch.Tensor:
+        """Zero-initialised residual projection plus an optional radial clip ``C_B``.
+
+        ``residual_clip > 0`` bounds every step to ``B`` in L2, which is what stops the
+        overshoot measured in ``tools/step_size_probe.py`` from accumulating over iterations.
+        ``B`` is a fixed budget taken from a calibration quantile of the *ideal* residual
+        (``tools/calibrate_residual_budget.py``), not a value tuned on the test set.
+        """
+        if self.residual_out is not None:
+            delta = self.residual_out(delta)
+        if self.residual_clip > 0:
+            norm = delta.norm(dim=-1, keepdim=True)
+            scale = (self.residual_clip / norm.clamp(min=1e-6)).clamp(max=1.0)
+            delta = delta * scale
+        if not torch.isfinite(delta).all():
+            # zero the bad entries rather than propagating NaN into the tokens and the loss
+            delta = torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
+            self.nonfinite_steps += 1
+        return delta
+
+    def _finish(self, v: torch.Tensor, total_delta: torch.Tensor,
+                variables_rgb: torch.Tensor, variables_tir: torch.Tensor, b: int,
+                identity_output: bool) -> Dict[str, torch.Tensor]:
+        """Assemble the returned views for either output parameterisation.
+
+        In ``identity_residual`` mode there is no output LayerNorm, so ``pre_norm`` *is* the
+        output and the norm-only control coincides with the input: the four-cell probe
+        degenerates to two cells by construction, and that has to be read as "the norm-only
+        baseline no longer exists", not as "the norm-only baseline is perfect".
+        """
+        if identity_output:
+            return {
+                "corrected_rgb": v[:b], "corrected_tir": v[b:],
+                "residual_rgb": total_delta[:b], "residual_tir": total_delta[b:],
+                "norm_only_rgb": v[:b], "norm_only_tir": v[b:],
+                "pre_norm_rgb": v[:b], "pre_norm_tir": v[b:],
+                "decoder_nonfinite_steps": self.nonfinite_steps,
+            }
+        # norm-only control: the output LayerNorm applied to the *uncorrected* input.  It
+        # isolates the pure scale change from the message updates, so a negative recovery_gain
+        # can be attributed (or not) to the Tanner messages.
         pre_norm = v
         norm_only = self.out_norm(torch.cat([variables_rgb, variables_tir], dim=0))
-        v = self.out_norm(pre_norm)
+        corrected = self.out_norm(pre_norm)
         return {
-            "corrected_rgb": v[:b],
-            "corrected_tir": v[b:],
+            "decoder_nonfinite_steps": self.nonfinite_steps,
+            "corrected_rgb": corrected[:b],
+            "corrected_tir": corrected[b:],
             "residual_rgb": total_delta[:b],
             "residual_tir": total_delta[b:],
             "norm_only_rgb": norm_only[:b],

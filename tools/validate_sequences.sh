@@ -50,6 +50,7 @@ override_flags() {
 condition_flags() {
   case "$1" in
     clean) echo "" ;;
+    noop_diag) echo "--corrupt-identity --diagnostics" ;;
     tok_block_rgb_02) echo "--corrupt --corrupt-token tok_block_erase --corrupt-target rgb --corrupt-ratio 0.2 --corrupt-severity 0.4" ;;
     tok_block_tir_02) echo "--corrupt --corrupt-token tok_block_erase --corrupt-target tir --corrupt-ratio 0.2 --corrupt-severity 0.4" ;;
     tok_block_both_02) echo "--corrupt --corrupt-token tok_block_erase --corrupt-target both --corrupt-ratio 0.2 --corrupt-severity 0.4" ;;
@@ -57,6 +58,11 @@ condition_flags() {
     tok_block_tir_04) echo "--corrupt --corrupt-token tok_block_erase --corrupt-target tir --corrupt-ratio 0.4 --corrupt-severity 0.4" ;;
     tok_block_both_04) echo "--corrupt --corrupt-token tok_block_erase --corrupt-target both --corrupt-ratio 0.4 --corrupt-severity 0.4" ;;
     tok_random_rgb_02) echo "--corrupt --corrupt-token tok_random_erase --corrupt-target rgb --corrupt-ratio 0.2 --corrupt-severity 0.4" ;;
+    # Non-zeroing family.  Every other token condition erases (sets tokens to zero) and the
+    # checkpoint was trained on one of those, so this is the condition on which the shipped
+    # decoder is measured to *inflate* the error (recovery_gain -0.88, docs/results.md 6.7.1)
+    # rather than no-op.  It is the arm comparison's test of the bounded-step hypothesis.
+    tok_noise_rgb_04) echo "--corrupt --corrupt-token tok_feat_noise --corrupt-target rgb --corrupt-ratio 0.4 --corrupt-severity 0.4" ;;
     rgb_lowlight_04) echo "--corrupt --corrupt-rgb rgb_lowlight --corrupt-severity 0.4" ;;
     rgb_occl_04) echo "--corrupt --corrupt-rgb rgb_occl --corrupt-severity 0.4" ;;
     tir_crossover_04) echo "--corrupt --corrupt-tir tir_crossover --corrupt-severity 0.4" ;;

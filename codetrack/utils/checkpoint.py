@@ -57,6 +57,29 @@ def load_checkpoint(path: Union[str, Path], model, optimizer=None,
             "loading it as-is leaves that arm's parameters randomly initialised."
         )
 
+    # The same guard for the two settings that change the decoder *at run time* rather than in the
+    # state dict.  ``decoder_output`` decides whether the branch norm and the residual projection
+    # exist at all, so loading an identity-residual arm into a post_norm model silently drops those
+    # tensors and evaluates a different network; ``gate_always_one`` decides whether the learned
+    # severity gate is applied at all, and an arm trained with the gate forced to 1 never received
+    # a gradient on that module, so evaluating it without the flag applies untrained weights.
+    # Both mistakes happened while running the P2 grid (docs/results.md 6.23), so they now fail
+    # loudly instead of producing a plausible-looking number.
+    checks = (
+        ("decoder_output", getattr(getattr(model, "decoder", None), "output_mode", None)),
+        ("gate_always_one", getattr(getattr(model, "decoder", None), "gate_always_one", None)),
+    )
+    for key, live_value in checks:
+        stored_value = stored_model.get(key)
+        if stored_value is None or live_value is None:
+            continue          # older checkpoints predate the key
+        if str(stored_value).lower().lstrip("'") != str(live_value).lower().lstrip("'"):
+            raise RuntimeError(
+                f"{path} was trained with model.{key}={stored_value} but the model is built "
+                f"with {live_value}.  Load it with --override model.{key}={stored_value} "
+                "(the evaluation runner has an OVERRIDES variable for exactly this)."
+            )
+
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if optimizer is not None and isinstance(ckpt, dict) and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])

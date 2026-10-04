@@ -35,6 +35,26 @@ model:
   # (the parameter-matched baseline); a positive value pins it, which is how a checkpoint
   # trained with an earlier auto formula can still be rebuilt (outputs/ab_mlp_corr used 2048).
   mlp_hidden: 0
+  # Output parameterisation of the decoder.
+  #   post_norm        : shipped behaviour -- update in raw token space, output LayerNorm.
+  #                      L_correct compares that output against pre-norm clean features, and
+  #                      tools/step_size_probe.py shows the update overshooting the ideal step
+  #                      by 2-10x while the LayerNorm absorbs the scale.
+  #   identity_residual: LayerNorm moves inside the update branch, the output is the raw
+  #                      residual sum, and a zero-initialised projection makes the model start
+  #                      at the identity.  No output LayerNorm exists in this mode, so the
+  #                      four-cell probe degenerates to two cells by construction.
+  decoder_output: post_norm
+  # L2 budget for one residual step (0 = unbounded).  Set it from
+  #   python tools/calibrate_residual_budget.py --quantile 0.99
+  # which takes a fixed high quantile of the IDEAL residual x* - x on a calibration split; on
+  # the 60-sequence development split that was 19.05 for RGB token block erasure at ratio 0.2.
+  residual_clip: 0.0
+  # Force the severity gate to 1, leaving only the (1 - r) reliability factor.  Measured: the
+  # learned gate is near zero on most damaged tokens and permuting its values within
+  # (reliability, ||d||) strata changes nothing, so the four-arm grid tests whether it earns
+  # its place at all.
+  gate_always_one: false
   h_links_per_check: 24
   # Optional degree-matched support construction for geometry ablations. Off preserves the
   # reference support sampler; on keeps every check row at h_links_per_check and balances

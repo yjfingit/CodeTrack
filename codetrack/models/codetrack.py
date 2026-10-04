@@ -118,6 +118,15 @@ class CodeTrack(nn.Module):
                                        # cannot be rebuilt from the current code without
                                        # ``model.mlp_hidden=2048``.
                                        mlp_hidden=int(get("mlp_hidden", 0)),
+                                       # "post_norm" is the shipped parameterisation (update in
+                                       # raw token space, normalised output).  The alternative
+                                       # moves the norm inside the update branch and leaves the
+                                       # output un-normalised with a zero-initialised residual
+                                       # projection, so the model starts at the identity and a
+                                       # bounded step cannot overshoot silently.
+                                       output_mode=str(get("decoder_output", "post_norm")),
+                                       residual_clip=float(get("residual_clip", 0.0)),
+                                       gate_always_one=bool(get("gate_always_one", False)),
                                        locality_window=int(get("h_locality_window", 0)),
                                        free_edge_frac=float(get("h_free_edge_frac", 0.25)),
                                        locality_wrap=bool(get("h_locality_wrap", True)),

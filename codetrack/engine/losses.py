@@ -102,7 +102,8 @@ class CodeTrackLoss(nn.Module):
                  gain_beta: float = 0.9, detect_reliability: float = 1.0,
                  detect_syndrome: float = 1.0, detect_localize: float = 1.0,
                  sigma: float = 0.05, num_parity: int = 16, dim: int = 768,
-                 code_dim: int = 256, temperature: float = 0.1):
+                 code_dim: int = 256, temperature: float = 0.1,
+                 detect_target: str = "mask", detect_deviation_cm: float = 0.2):
         super().__init__()
         self.cls_weight = cls_weight
         self.l1_weight = l1_weight
@@ -127,6 +128,13 @@ class CodeTrackLoss(nn.Module):
         self.sigma = sigma
         self.num_parity = num_parity
         self.temperature = temperature
+        # "mask" = shipped binary injected-mask target; "deviation" = continuous feature
+        # deviation from the frozen teacher (see _detect_loss).  c_m sets the squash scale and
+        # must come from a calibration split, not from the evaluation set.
+        if detect_target not in ("mask", "deviation"):
+            raise ValueError(f"unknown detect_target {detect_target!r}")
+        self.detect_target = str(detect_target)
+        self.detect_deviation_cm = float(detect_deviation_cm)
         # projects the identity codebook (code_dim) into token space (dim)
         self.identity_proj = nn.Linear(code_dim, dim)
 
@@ -140,31 +148,50 @@ class CodeTrackLoss(nn.Module):
                      mask_rgb: torch.Tensor, mask_tir: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Reliability + syndrome + localization supervision (fp32).
 
-        The syndrome target is derived from the **shared parity-check matrix**, but it is
-        a *soft* target: the corruption **density inside each check's neighbourhood**,
+        Two target modes (``self.detect_target``):
 
-            q_j = sum_i 1[H_ji > 0] * M_i / sum_i 1[H_ji > 0]
+        * ``"mask"`` (default, shipped): the target is the injected corruption mask.  It is a
+          perfect label for "did the corruption function fire on this token", which is exactly
+          why the reliability head reaches AUROC 1.000 against that mask (section 6.7 of
+          ``docs/results.md``) -- and why the number cannot be read as real degradation
+          detection.
+        * ``"deviation"``: the target is the *continuous feature deviation*
+          ``e_i = mean_c |x_i - x*_i|`` between the corrupted token view and the frozen
+          teacher, squashed to ``q_i = e_i / (e_i + c_m)``.  It supervises "how far this token
+          moved from what it should have been" instead of "which corruption function fired",
+          so it is definable for any degradation that has a teacher.  It is still teacher
+          distillation, not real-degradation ground truth.  Falls back to the mask when there
+          is no corrupted token view (image-level corruption).
 
-        not the binary "check j saw at least one bad token".  The binary version is
-        useless here: ``min_column_degree=2`` over ``N=256`` variables forces at least
-        ``2*256/M = 32`` edges per check, so under 20% random erasure
-        ``1[(H@M)>0]`` fires with probability ~0.999 and the BCE degenerates into
-        "predict 1 everywhere".  The density target stays informative at any corruption
-        ratio and lets training keep the hard 20% setting instead of lowering it to make
-        the syndrome learnable.
-
-        RGB and TIR reliabilities are supervised with their own masks, so a healthy
-        modality is not dragged down.
+        The syndrome target stays the per-check **density** over the fixed binary support,
+        never the learnable weights: the neighbourhood a check watches is structural and must
+        not be allowed to move to make the target easier.  RGB and TIR reliabilities are
+        supervised with their own targets, so a healthy modality is not dragged down.
         """
         mask_rgb = mask_rgb.float()
         mask_tir = mask_tir.float()
         mask_any = torch.clamp(mask_rgb + mask_tir, max=1.0).detach()
 
+        clean = outputs.get("clean_tokens")
+        target_rgb, target_tir = mask_rgb, mask_tir
+        if (self.detect_target == "deviation" and clean is not None
+                and outputs.get("corrupted_rgb") is not None
+                and outputs.get("corrupted_tir") is not None):
+            # per-token L1 deviation from the frozen teacher, squashed into [0, 1)
+            dev_rgb = (outputs["corrupted_rgb"].float()
+                       - clean["rgb"].float()).abs().mean(dim=-1).detach()
+            dev_tir = (outputs["corrupted_tir"].float()
+                       - clean["tir"].float()).abs().mean(dim=-1).detach()
+            target_rgb = dev_rgb / (dev_rgb + self.detect_deviation_cm)
+            target_tir = dev_tir / (dev_tir + self.detect_deviation_cm)
+            # the locator now asks "where did the features move", so it takes the deviation
+            mask_any = torch.clamp(0.5 * (target_rgb + target_tir), max=1.0).detach()
+
         reliability = (
             F.binary_cross_entropy(outputs["reliability_rgb"].float().clamp(1e-4, 1 - 1e-4),
-                                   (1.0 - mask_rgb).clamp(0.0, 1.0))
+                                   (1.0 - target_rgb).clamp(0.0, 1.0))
             + F.binary_cross_entropy(outputs["reliability_tir"].float().clamp(1e-4, 1 - 1e-4),
-                                     (1.0 - mask_tir).clamp(0.0, 1.0)))
+                                     (1.0 - target_tir).clamp(0.0, 1.0)))
 
         # fixed binary support, NOT the learnable weights: the neighbourhood a check
         # watches is a structural property and must not move to make the target easier.

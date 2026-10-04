@@ -216,6 +216,147 @@ def test_mlp_baseline_matches_bp_shapes_and_stays_parameter_matched():
     assert out["corrected_rgb"].shape == (2, mlp.num_variables, 64)
 
 
+def test_spatial_mixer_baseline_is_parameter_matched_and_grid_local():
+    """P5: the primary control is a *local spatial* mixer without parity or syndrome.
+
+    It must (a) be usable and parameter-matched against BP, (b) mix only a limited neighbourhood
+    -- otherwise a conv over the grid would silently be a global mixer -- and (c) not depend on
+    the parity/syndrome inputs at all, since those are what the Tanner path claims to add.
+    """
+    spatial_cfg = tiny_cfg()
+    spatial_cfg["model"]["decoder_mode"] = "spatial"
+    spatial = CodeTrack(spatial_cfg)
+    bp = CodeTrack(tiny_cfg())
+
+    assert spatial.decoder.spatial_conv is not None
+    assert len(spatial.decoder.spatial_conv) == 2          # one per iteration
+    assert spatial.decoder.grid ** 2 == spatial.num_variables
+    bp_params = sum(p.numel() for p in bp.decoder.parameters())
+    spatial_params = sum(p.numel() for p in spatial.decoder.parameters())
+    assert 0.98 < spatial_params / bp_params < 1.02, \
+        f"spatial arm not parameter-matched: {spatial_params} vs {bp_params}"
+
+    decoder = spatial.decoder.eval()
+    b, n, d = 1, decoder.num_variables, 64
+    grid = decoder.grid
+    index = torch.stack([torch.arange(8)])
+    gates = (torch.ones(b, 8), torch.ones(b, 8))
+    parity = torch.randn(b, decoder.num_parity, 32)
+    syndrome = torch.rand(b, 1, decoder.num_parity)
+    reliability = torch.zeros(b, n)
+
+    def run(rgb, tir, parity_in, syndrome_in):
+        return decoder(rgb, tir, parity_in, syndrome_in, reliability, reliability,
+                       gate_rgb=gates[0], gate_tir=gates[1], node_index=index)
+
+    rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+    baseline = run(rgb, tir, parity, syndrome)
+    # (c) parity and syndrome are not inputs of this path
+    changed = run(rgb, tir, torch.randn(b, decoder.num_parity, 32),
+                  torch.rand(b, 1, decoder.num_parity))
+    assert torch.equal(baseline["corrected_rgb"], changed["corrected_rgb"])
+
+    # (b) locality: with two rounds information travels at most two grid steps
+    perturbed = rgb.clone()
+    perturbed[0, 0] += 5.0
+    after = run(perturbed, tir, parity, syndrome)
+    difference = (after["corrected_rgb"] - baseline["corrected_rgb"]).abs().amax(dim=-1)[0]
+    for token in range(n):
+        row, column = divmod(token, grid)
+        distance = max(row, column)
+        if distance >= 3:
+            assert float(difference[token]) == 0.0, \
+                f"token {token} at Chebyshev distance {distance} changed: not a local mixer"
+    assert float(difference[0]) > 0.0
+    assert float(difference[0]) > float(difference[grid + 1])
+
+
+def test_identity_residual_output_starts_as_an_exact_passthrough():
+    """P2: the new parameterisation must begin at the identity, in both decoder modes.
+
+    ``residual_out`` is zero-initialised, so the very first step is exactly zero, the output is
+    not normalised, and the corrected tokens equal the inputs bit for bit.  That is what makes
+    the identity-residual arm comparable to the ``off`` arm at initialisation.
+    """
+    for mode in ("bp", "mlp"):
+        cfg = tiny_cfg()
+        cfg["model"]["decoder_mode"] = mode
+        cfg["model"]["decoder_output"] = "identity_residual"
+        decoder = CodeTrack(cfg).decoder.eval()
+        b, n, d = 2, decoder.num_variables, 64
+        rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+        index = torch.stack([torch.randperm(n)[:8] for _ in range(b)])
+        out = decoder(rgb, tir, torch.randn(b, decoder.num_parity, 32),
+                      torch.rand(b, 1, decoder.num_parity), torch.rand(b, n), torch.rand(b, n),
+                      gate_rgb=torch.rand(b, 8), gate_tir=torch.rand(b, 8), node_index=index)
+
+        assert torch.equal(out["corrected_rgb"], rgb), f"{mode}: output is not the identity"
+        assert torch.equal(out["corrected_tir"], tir), f"{mode}: output is not the identity"
+        assert torch.count_nonzero(out["residual_rgb"]) == 0
+        # no output LayerNorm exists in this mode, so the norm-only cell coincides with the
+        # input: the four-cell probe degenerates and cannot be read as a baseline
+        assert torch.equal(out["norm_only_rgb"], rgb)
+
+
+def test_residual_clip_bounds_every_step():
+    cfg = tiny_cfg()
+    cfg["model"]["decoder_output"] = "identity_residual"
+    cfg["model"]["residual_clip"] = 0.5
+    decoder = CodeTrack(cfg).decoder.eval()
+    torch.nn.init.constant_(decoder.residual_out.bias, 3.0)     # force a large step
+
+    step = decoder._step(torch.randn(2, decoder.num_variables, 64))
+    norms = step.norm(dim=-1)
+
+    assert float(norms.max()) <= 0.5 + 1e-5
+    assert float(norms.min()) > 0.0                              # clipping, not zeroing
+
+
+def test_residual_clip_zero_is_off():
+    cfg = tiny_cfg()
+    cfg["model"]["decoder_output"] = "identity_residual"
+    decoder = CodeTrack(cfg).decoder.eval()
+    torch.nn.init.constant_(decoder.residual_out.bias, 3.0)
+
+    step = decoder._step(torch.zeros(2, decoder.num_variables, 64))
+
+    assert float(step.norm(dim=-1).min()) > 1.0                  # untouched by the clip
+
+
+def test_gate_always_one_removes_the_learned_severity_gate():
+    cfg = tiny_cfg()
+    decoder = CodeTrack(cfg).decoder.eval()                      # default post_norm mode
+    b, n, d = 1, decoder.num_variables, 64
+    rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+    index = torch.stack([torch.randperm(n)[:8]])
+    args = (torch.randn(b, decoder.num_parity, 32), torch.rand(b, 1, decoder.num_parity),
+            torch.rand(b, n), torch.rand(b, n))
+    ones = torch.ones(b, 8)
+
+    explicit = decoder(rgb, tir, *args, gate_rgb=ones, gate_tir=ones, node_index=index)
+    decoder.gate_always_one = True
+    override = decoder(rgb, tir, *args, gate_rgb=torch.zeros(b, 8),
+                       gate_tir=torch.zeros(b, 8), node_index=index)
+
+    assert torch.equal(explicit["pre_norm_rgb"], override["pre_norm_rgb"])
+    assert torch.equal(explicit["pre_norm_tir"], override["pre_norm_tir"])
+
+
+def test_default_output_mode_still_applies_the_output_norm():
+    cfg = tiny_cfg()
+    decoder = CodeTrack(cfg).decoder.eval()
+    b, n, d = 1, decoder.num_variables, 64
+    rgb, tir = torch.randn(b, n, d), torch.randn(b, n, d)
+    index = torch.stack([torch.randperm(n)[:8]])
+    out = decoder(rgb, tir, torch.randn(b, decoder.num_parity, 32),
+                  torch.rand(b, 1, decoder.num_parity), torch.rand(b, n), torch.rand(b, n),
+                  gate_rgb=torch.ones(b, 8), gate_tir=torch.ones(b, 8), node_index=index)
+
+    assert decoder.output_mode == "post_norm"
+    assert not torch.allclose(out["corrected_rgb"], out["pre_norm_rgb"])
+    assert decoder.residual_out is None and decoder.branch_norm is None
+
+
 def test_explicit_mlp_width_overrides_the_auto_formula():
     """The stored arm in ``outputs/ab_mlp_corr`` was trained at 2048 hidden (the pre-fix
     auto formula) and cannot be rebuilt without naming the width.  ``mlp_hidden=0`` must stay
@@ -824,3 +965,24 @@ def test_decoder_off_is_a_true_passthrough():
                         torch.rand(b, 1, model.num_parity), torch.rand(b, n), torch.rand(b, n))
     assert torch.equal(out["corrected_rgb"], out["norm_only_rgb"])  # untouched
     assert float(out["residual_rgb"].abs().sum()) == 0.0
+
+
+def test_identity_residual_zeroes_a_non_finite_step_and_counts_it():
+    """An fp16 overflow in the un-normalised residual path must be a counted event, not a fatal
+    device-side assert: one NaN in the update used to abort a whole training run."""
+    cfg = tiny_cfg()
+    cfg["model"]["decoder_output"] = "identity_residual"
+    cfg["model"]["residual_clip"] = 1.0
+    decoder = CodeTrack(cfg).decoder.eval()
+
+    poisoned = torch.full((2, decoder.num_variables, 64), float("nan"))
+    out = decoder._step(poisoned)
+
+    assert torch.isfinite(out).all()
+    assert torch.count_nonzero(out) == 0
+    assert decoder.nonfinite_steps == 1
+
+    # a healthy step must not be touched or counted
+    healthy = torch.randn(2, decoder.num_variables, 64)
+    decoder._step(healthy)
+    assert decoder.nonfinite_steps == 1

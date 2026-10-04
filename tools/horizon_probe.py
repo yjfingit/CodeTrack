@@ -54,13 +54,45 @@ def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def loss_frame(iou: np.ndarray, window: int = 20, threshold: float = 0.5) -> Optional[int]:
-    """First frame after which the rolling mean IoU never returns above ``threshold``."""
+    """First frame after which the rolling mean IoU never returns above ``threshold``.
+
+    Descriptive only: it looks at the *whole* trace and at the total horizon, so it is not a
+    first-failure event (see :func:`first_failure` for the forward-decidable version).
+    """
     smoothed = rolling_mean(iou, window)
     below = smoothed < threshold
     for start in range(len(below)):
         if below[start:].all():
             return start + window // 2
     return None
+
+
+def first_failure(iou: np.ndarray, threshold: float = 0.5, patience: int = 20
+                  ) -> Optional[int]:
+    """First frame of a run of ``patience`` consecutive frames below ``threshold``.
+
+    Forward-decidable: the decision at frame ``t`` depends only on frames ``<= t``, so it is a
+    real event a tracker could detect online, and it does not need the rest of the horizon.
+    """
+    run = 0
+    for index, value in enumerate(iou):
+        run = run + 1 if float(value) < threshold else 0
+        if run >= patience:
+            return index - patience + 1
+    return None
+
+
+def recovered_after(iou: np.ndarray, failure: Optional[int], threshold: float = 0.5,
+                    patience: int = 20) -> Optional[bool]:
+    """Did a run of ``patience`` consecutive frames at or above threshold follow the failure?"""
+    if failure is None:
+        return None
+    run = 0
+    for value in iou[failure + patience:]:
+        run = run + 1 if float(value) >= threshold else 0
+        if run >= patience:
+            return True
+    return False
 
 
 def main() -> int:
@@ -74,6 +106,9 @@ def main() -> int:
                         help="how many sequences to probe when no list is given")
     parser.add_argument("--frames", type=int, default=200)
     parser.add_argument("--window", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=20,
+                        help="consecutive frames below the threshold that count as a failure; "
+                             "this is the forward-decidable definition")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--out", default="outputs/horizon_probe.json")
     parser.add_argument("--override", action="append", default=[])
@@ -107,6 +142,8 @@ def main() -> int:
             continue
         iou = _box_iou(pred, gt)
         lost = loss_frame(iou, args.window, args.threshold)
+        failure = first_failure(iou, args.threshold, args.patience)
+        recovered = recovered_after(iou, failure, args.threshold, args.patience)
         window = min(args.window, len(iou))
         row = {
             "sequence": sequence,
@@ -117,6 +154,9 @@ def main() -> int:
             "iou_mean_first": float(iou[:window].mean()),
             "iou_mean_last": float(iou[-window:].mean()),
             "loss_frame": lost,
+            "failure_frame": failure,
+            "recovered_after_failure": recovered,
+            "time_to_failure_censored": (int(len(iou)) if failure is None else int(failure)),
             "tracked_fraction": 1.0 if lost is None else float(lost) / len(iou),
             "iou_trace_every_10": [float(iou[i]) for i in range(0, len(iou), 10)],
         }
@@ -142,6 +182,22 @@ def main() -> int:
                                                if row["loss_frame"] is not None]))
                               if any(row["loss_frame"] is not None for row in valid)
                               else None),
+        # forward-decidable failure event: K consecutive frames below threshold, with the
+        # un-failed sequences right-censored at the horizon
+        "failure_patience": args.patience,
+        "failure_fraction": (float(np.mean([row["failure_frame"] is not None for row in valid]))
+                             if valid else float("nan")),
+        "failure_frame_median": (float(np.median([row["failure_frame"] for row in valid
+                                                  if row["failure_frame"] is not None]))
+                                 if any(row["failure_frame"] is not None for row in valid)
+                                 else None),
+        "mean_time_to_failure_censored": (float(np.mean(
+            [row["time_to_failure_censored"] for row in valid])) if valid else float("nan")),
+        "recovery_rate_after_failure": (float(np.mean(
+            [bool(row["recovered_after_failure"]) for row in valid
+             if row["recovered_after_failure"] is not None]))
+            if any(row["recovered_after_failure"] is not None for row in valid)
+            else float("nan")),
         "loss_frame_quartiles": ([float(v) for v in np.quantile(
             [row["loss_frame"] for row in valid if row["loss_frame"] is not None],
             [0.25, 0.5, 0.75])]
@@ -150,6 +206,11 @@ def main() -> int:
     }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2))
+    print(f"failure (patience {args.patience} < {args.threshold}): "
+          f"{summary['failure_fraction'] * 100:.1f}% of sequences | median failure frame "
+          f"{summary['failure_frame_median']} | mean censored time-to-failure "
+          f"{summary['mean_time_to_failure_censored']:.1f} frames | recovery rate "
+          f"{summary['recovery_rate_after_failure']:.2f}")
     print(f"{len(valid)} sequences | SR {summary['sr_mean']:.4f} | "
           f"mean IoU {summary['iou_mean']:.4f} | never lost "
           f"{summary['never_lost_fraction'] * 100:.1f}% | loss frame median "

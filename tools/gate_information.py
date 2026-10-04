@@ -15,8 +15,13 @@ injected mask:
 * ``locator_scattered``    -- ``H^T s``, supervised with ``BCE(locator, mask)``;
 * ``syndrome``             -- the per-check map, scored per *check* against the realized
   corruption density of that check's neighbourhood (not per token);
-* ``gate_rgb``             -- the severity gate actually handed to the decoder, scattered to
-  the variable grid the way ``_expand_gate`` does (unselected variables keep the neutral 1).
+* ``gate_rgb``             -- the severity gate handed to the decoder, scattered the way
+  ``_expand_gate`` does (unselected variables keep the neutral 1).  This is *not* the
+  applied coefficient;
+* ``applied_coefficient``   -- ``(1 - r) * gate`` on the same grid, i.e. what the decoder
+  actually multiplies the update by.  The two differ through the reliability factor and the
+  neutral entries, and the selector's preference for damaged tokens makes the unscaled
+  ``gate_rgb`` AUC uninterpretable on its own.
 
 Usage::
 
@@ -89,7 +94,8 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     scores: Dict[str, List[float]] = {"unreliability_rgb": [], "locator_scattered": [],
                                       "selection_of_damage": [], "gate_within_selected": [],
-                                      "effective_gate_rgb": [], "syndrome_density_rho": []}
+                                      "effective_gate_rgb": [], "applied_coefficient": [],
+                                      "syndrome_density_rho": []}
     frames_done = 0
     for plan in plans:
         sequence = str(plan["sequence"])
@@ -140,10 +146,15 @@ def main() -> int:
             scores["locator_scattered"].append(auroc(
                 out["locator_scattered"][0].float().cpu().numpy(), labels))
 
-            # Effective gate on the full variable grid, exactly as the decoder applies it:
-            # selected nodes get the learned value, unselected keep the neutral 1.  The two
-            # components are reported separately because they can point opposite ways --
-            # selection may follow damage while the gate level does not.
+            # Gate components on the full variable grid.  ``effective_gate_rgb`` is the
+            # network's *severity* gate only (selected nodes get the learned value,
+            # unselected keep the neutral 1) -- it is NOT the coefficient the decoder
+            # multiplies the update by.  That coefficient is ``(1 - r) * gate`` and is
+            # scored separately as ``applied_coefficient``; on injected damage (1 - r) is 1,
+            # so the two differ mainly through the reliability factor and the neutral
+            # entries.  Reading ``effective_gate_rgb`` as "the decoder suppresses the
+            # repair" was wrong: the selector prefers damaged tokens, so the neutral 1s are
+            # concentrated on healthy tokens by construction.
             gate = captured.get("gate_rgb")
             index = captured.get("node_index")
             if gate is not None and index is not None:
@@ -159,6 +170,9 @@ def main() -> int:
                 if 0 < selected_labels.sum() < len(selected_labels):
                     scores["gate_within_selected"].append(auroc(
                         gate[0].float().cpu().numpy(), selected_labels))
+                reliability = out["reliability_rgb"][0].float().cpu()
+                applied = (1.0 - reliability) * effective
+                scores["applied_coefficient"].append(auroc(applied.numpy(), labels))
 
             # per-check syndrome vs the realized corruption density of that check.  The
             # evaluator reports a rank correlation, so a binary "density > 0" label is

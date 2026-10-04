@@ -167,6 +167,10 @@ def summarize_detection(syndrome_scores: Sequence[np.ndarray],
                         locator_labels: Sequence[np.ndarray],
                         syndrome_clean: Optional[Sequence[np.ndarray]] = None,
                         syndrome_density: Optional[Sequence[np.ndarray]] = None,
+                        reliability_rgb: Optional[Sequence[np.ndarray]] = None,
+                        reliability_labels_rgb: Optional[Sequence[np.ndarray]] = None,
+                        reliability_tir: Optional[Sequence[np.ndarray]] = None,
+                        reliability_labels_tir: Optional[Sequence[np.ndarray]] = None,
                         density_threshold: float = 0.5,
                         topk: int = 5) -> Dict[str, float]:
     """Aggregate detection metrics and localization recall over a corpus.
@@ -207,6 +211,25 @@ def summarize_detection(syndrome_scores: Sequence[np.ndarray],
         "locator_chance_at_%d" % topk: (chance_level(topk, n_tokens, 1)
                                         if loc_s.size else float("nan")),
     }
+
+    # The reliability head is what the decoder actually multiplies (through 1 - r), so its AUROC
+    # against the token mask belongs in the evaluation summary.  Scoring it only in
+    # tools/gate_information.py left the training corruption family unscored, and "AUROC 1.000
+    # means memorisation" could not be tested against a *held-out* family.
+    for tag, scores, labels in (("rgb", reliability_rgb, reliability_labels_rgb),
+                                ("tir", reliability_tir, reliability_labels_tir)):
+        if scores is None or labels is None:
+            continue
+        score = _concat(scores)
+        label = _concat(labels).astype(bool)
+        if score.size and label.size == score.size and label.any() and (~label).any():
+            out[f"reliability_auroc_{tag}"] = auroc(score, label)
+        else:
+            out[f"reliability_auroc_{tag}"] = float("nan")
+    keys = [key for key in ("reliability_auroc_rgb", "reliability_auroc_tir") if key in out]
+    if keys:
+        values = [out[key] for key in keys if np.isfinite(out[key])]
+        out["reliability_auroc"] = float(np.mean(values)) if values else float("nan")
 
     if syndrome_density is not None:
         dens = _concat(syndrome_density)
