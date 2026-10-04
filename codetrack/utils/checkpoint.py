@@ -83,6 +83,31 @@ def load_checkpoint(path: Union[str, Path], model, optimizer=None,
                 "(the evaluation runner has an OVERRIDES variable for exactly this)."
             )
 
+    # Adapters are a fourth case of the same problem, with a twist: the *enabled* flag alone is not
+    # enough, because two adapters of different rank or modality routing also have different state
+    # dicts.  A rank mismatch would leave the ``lora_b`` matrices randomly initialised -- and since
+    # they start at zero, that means a *random* delta added to the frozen backbone instead of the
+    # trained one, which no metric would flag as impossible.
+    stored_lora = stored_model.get("lora") or {}
+    live_lora = live_model.get("lora") or {}
+    stored_enabled = bool(stored_lora.get("enabled", False))
+    live_enabled = bool(live_lora.get("enabled", False))
+    if stored_enabled != live_enabled:
+        raise RuntimeError(
+            f"{path} was trained with model.lora.enabled={stored_enabled} but the model is built "
+            f"with {live_enabled}.  Adapters are inside the frozen blocks, so a mismatch either "
+            "drops trained low-rank deltas or adds untrained ones; load it with "
+            f"--override model.lora.enabled={str(stored_enabled).lower()}."
+        )
+    if stored_enabled:
+        for key in ("rank", "alpha", "per_modality"):
+            if key in stored_lora and key in live_lora and stored_lora[key] != live_lora[key]:
+                raise RuntimeError(
+                    f"{path} was trained with model.lora.{key}={stored_lora[key]} but the model "
+                    f"is built with {live_lora[key]}.  Rebuild the matching adapter "
+                    "(docs/results.md 6.27.4)."
+                )
+
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if optimizer is not None and isinstance(ckpt, dict) and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])

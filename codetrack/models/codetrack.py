@@ -68,6 +68,9 @@ class CodeTrack(nn.Module):
             "return_stages": self.return_stages,
             "freeze": bool(get("freeze_backbone", True)),
             "tir_from_rgb": bool(get("tir_from_rgb", True)),
+            # Optional low-rank adapters inside the frozen blocks: the capacity-location arm.
+            # Off by default, so the backbone stays bit-identical (docs/results.md 6.27.4).
+            "lora": get("lora", None),
         }})
 
         self.codebook = TargetCodebookEncoder(

@@ -6,7 +6,51 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Capacity-location experiment**: `model.lora.*` installs a frozen-weight, low-rank adapter on the
+  Q and V slices of every attention block (`codetrack/models/backbone/lora.py`), optionally per
+  modality. `B` is zero-initialised so step 0 is an exact identity, and the adapter's own init
+  draws from a *local* generator so it does not shift the global RNG stream and therefore does not
+  change any other module's initial weights. `freeze_backbone()` deliberately keeps the adapters
+  trainable. Rank 8, per-modality, 12 blocks = **0.590 M** parameters, and
+  `load_ostrack_pretrained` aliases the wrapped projection so the OSTrack checkpoint still loads.
+  `configs/experiment/lasher_vitb_lora.yaml` is the experiment arm.
+- Optimizer **parameter groups**: adapters (`train.lr_lora`), decayed weights, and norms/biases
+  without weight decay. With no adapter installed the result is the previous single-rate behaviour.
+- `train.schedule` (`constant` default, or `cosine`) with `train.warmup_steps` / `train.max_steps`,
+  off by default so archived constant-rate runs stay comparable.
+- `tools/search_containment.py` -- is the target still inside the crop the tracker is looking at
+  when it fails, and how much does a perfect (lagged ground-truth) crop schedule recover? Records
+  containment, centre offset and window-to-object scale ratio; the last two are needed because a
+  4x crop square keeps the target "inside" through a drift of more than one object width.
+- `tools/token_oracle_interp.py` -- replaces the corrupted fusion inputs with the clean pass's
+  tensors (`z_alpha = (1-alpha)*corrupted + alpha*clean`), i.e. an oracle repair, with a per-sequence
+  assertion that `alpha = 0` reproduces the plain corrupted run bit for bit. Reports `--include-taps`
+  and `--scope foreground|background` variants.
+- `tools/inference_protocol_audit.py` -- measures the two protocol differences from the official
+  OSTrack tracker (the crop geometry used to map the box back, and the missing score-map window)
+  against the historical behaviour, paired on the same sequences.
+- `eval.crop_mapping` and `eval.score_window`: both protocol differences are now switchable, both
+  default to the historical behaviour. `crop_geometry` in `codetrack/data/transforms/sample.py`
+  exposes the geometry `_crop_square` actually takes.
+- `docs/results.md` 6.28 -- the two train-free diagnostics and what they jointly say about where
+  the failure is.
+
 ### Fixed
+- **The box mapping ignored the crop's own clamps.** `_crop_square` clamps the side to
+  `MAX_CROP_SIDE_FACTOR` times the longer frame edge and pulls the centre onto the frame, but the
+  loop mapped the head's normalised box back with the *requested* centre and side. Whenever either
+  clamp fired the prediction was placed wrongly by exactly the clamped-minus-requested offset --
+  in the diverged regime the clamp exists for -- and nothing else in the pipeline could notice.
+  `eval.crop_mapping="actual"` uses the geometry the model was actually given; the default keeps
+  the old mapping so archived numbers stay reproducible.
+- **The gradient diagnostic crashed on a `lambda_correct = 0` arm.** The weighted reading added in
+  the previous round made the *unweighted* `cos(L_track, L_correct)` optional in the diagnostic
+  dict, but the log line still indexed it unconditionally, so a lambda sweep died on the first
+  logged step. Both parts of the line are now optional.
+- `set_trainable()` (the codec warm-up) now also freezes the adapters, so a warm-up stage cannot
+  leave them training while the config claims otherwise.
+
 - **Decoder iteration state is now explicit** (`model.decoder_state_mode`: `recurrent` default,
   `held` optional). `073c223` had silently frozen the branch input for every non-identity output
   mode, so `post_norm`/`mlp`/`spatial` changed *function* from round 2 on while the commit and
@@ -42,7 +86,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   only the unweighted `cos(L_track, L_correct)`, which cannot separate "repair is ineffective" from
   "repair is harmful". `LossOutput` now exposes the graph-connected copies of every weighted term.
 
-### Added
 - `codetrack/utils/provenance.py` and `run_provenance.json` per training run / `eval_provenance` +
   `train_provenance` per evaluation manifest: commit, dirty flag, decoder function switches, active
   parameter count, peak memory. `tools/run_provenance_audit.py` reports which existing numbers can

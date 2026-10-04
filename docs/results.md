@@ -1926,6 +1926,100 @@ Fixed now, so the round-2 results cannot be read selectively afterwards.
 | LoRA vs frozen, at fixed capacity budget | F0/F1/A0/A1 | the interaction `(A1−A0) − (F1−F0)` | not started |
 | spatial+identity_residual+gate vs arm C | new arm vs `p2_C` | robustness composite | not started |
 
+### 6.28 Where the failure actually is: the crop trajectory, not the tokens
+
+Sections 6.24 and 6.26 improved the repair mechanism twice and the robustness contrast did not move
+(once against the improved arm).  That raised the question 6.27.4 pre-registers: is per-token repair
+quality even a mediator for tracking?  Neither earlier experiment ever handed the tracker a
+*repaired* token set -- both changed how hard the repair was asked to work.  Two train-free
+diagnostics now do the direct thing.
+
+Both are pilot-scale in this section (10 sequences x 60 frames from the 60-sequence split, one
+severity, one condition `tok_block_erase` at ratio 0.2 on both modalities, one seed); the
+60-sequence x 200-frame runs are queued and this section will be replaced by their numbers.
+
+#### 6.28.1 Is the target still in the window when the tracker loses it? (`tools/search_containment.py`)
+
+`Trainer.infer_sequence` records the box that drove each frame's crop, so containment, centre
+offset and window-to-object scale ratio are all computable per frame.  Containment alone is a weak
+instrument -- the crop square is four object-widths across, so the target stays "inside" it through
+a drift of more than one object width -- which is why the other two measures are reported with it.
+
+For the three pilot sequences that fail inside 60 frames:
+
+| quantity (after the failure) | value |
+|---|---|
+| fraction of the ground-truth box inside the crop | **1.000** (3/3 sequences fully inside) |
+| centre offset, in crop sides | **0.205** (0.5 would put the target on the boundary) |
+| window side / object side | **5.08** (a correct prediction gives exactly 4.0) |
+| frames that are both on-centre and at the right scale | **88.3 %** |
+
+So the target is **in the window, near the centre, at almost the intended scale**, and the tracker
+still fails.  And re-running the same condition with the crop schedule replaced by the lagged
+ground truth -- which changes *only* where the window points, leaving model, corruption and head
+untouched -- lifts mean IoU from **0.235 to 0.801** and SR from 0.272 to 0.978.
+
+The failure is therefore not "the target left the frame": the window is roughly where it should be,
+the tracker's *box* is what has drifted, and the drift persists because the next crop is derived
+from the drifted box.  That is a within-window self-consistency failure, and the pilot reading is
+that **the search range is not the lever**, which is the opposite of what the failure statistics of
+6.17.1 suggest on their own.
+
+#### 6.28.2 Is a repaired token set a useful mediator? (`tools/token_oracle_interp.py`)
+
+Every frame is run twice -- once with the token corruption off (caching what fusion receives) and
+once with the corruption on, where the corrupted tensors are replaced at the fusion input by
+`z_alpha = (1 - alpha) * z_corrupted + alpha * z_clean`.  `alpha = 1` is therefore an **oracle
+repair**: the decoder's output is perfect, with the model, the crop loop and the head unchanged.
+`alpha = 0` must reproduce the plain corrupted run bit for bit, and it does
+(`alpha0_consistent = {fixed: True, free: True}`) -- so the extra clean forward perturbs nothing.
+
+Mean IoU over the 10 pilot sequences:
+
+| mode | `alpha = 0` | `alpha = 0.5` | `alpha = 1` | gain |
+|---|---:|---:|---:|---:|
+| **fixed crop** (crops from the clean trajectory) | 0.2607 | 0.2714 | 0.2763 | **+0.016** |
+| **free loop** (the real tracker) | 0.1823 | 0.2769 | 0.3087 | **+0.126** |
+
+Two things follow, and they are the point of the section.
+
+* **With the crops held fixed, an oracle repair of the tokens barely moves the per-frame response**
+  (+0.016 IoU, +1.3 SR points).  On this reading the token damage is not what limits the tracker
+  frame by frame.
+* **The entire oracle gain appears in the closed loop** (+0.126 IoU, +14 SR points): perfect tokens
+  keep the tracker from drifting.  Per sequence the gain is concentrated --
+  `boytakingbasketballfollowing` +0.685, `carcominginlight` +0.335, six sequences below +0.07, one
+  at -0.013 -- so this is not a uniform improvement but the prevention of catastrophic drift on a
+  few sequences.
+
+`--include-taps` (interpolating the backbone FPN taps too, so the shortcut path cannot carry the
+corruption the tokens just lost) makes the free-loop gain **smaller**, 0.1823 -> 0.2641, and turns
+two sequences negative.  The taps were trained *masked*, so handing them over unmasked is an
+out-of-distribution intervention rather than a strictly better repair; the token-only cell is the
+cleaner oracle.
+
+#### 6.28.3 What the two together say
+
+Both diagnostics point at the same place, and it is not the tokens:
+
+1. the per-frame response is nearly insensitive to whether the tokens are damaged (6.28.2, fixed
+   crop);
+2. the target is inside a reasonably framed window when the tracker fails (6.28.1);
+3. both the tokens-oracle and the crop-oracle rescue the tracker by preventing or undoing **crop
+   drift** (6.28.1, 6.28.2 free loop).
+
+That is a *much* narrower and better supported statement than "per-token repair quality is not the
+bottleneck", which 6.27 retracts: what the measurements support is that **the tracking outcome is
+governed by the crop trajectory, not by the token-level repair**, on this checkpoint and this
+corruption family.  It also re-orders the candidate next steps: a local window re-centring
+mechanism is measured to be worth +0.57 IoU on the pilot, while a *global* re-detection stage is
+aimed at a failure mode the containment measurement does not show.
+
+Not established here: whether the same holds for image-level conditions (`rgb_occl_04`, the
+pre-registered primary) or under closed-loop divergence; whether the crops were already off-centre
+*before* the failure; and whether the oracle gains survive at 60 sequences x 200 frames.  All three
+are part of the queued run.
+
 ## 1. Clean evaluation (no injected corruption)
 | Tracker | Backbone | Params (M) | GFLOPs | FPS | Dataset | PR | SR (AUC) | NPR |
 |---|---|---:|---:|---:|---|---:|---:|---:|

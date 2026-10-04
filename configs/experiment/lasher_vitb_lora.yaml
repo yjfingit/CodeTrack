@@ -1,0 +1,39 @@
+# Capacity-location experiment: identical frozen weights, adapters *inside* the blocks.
+#
+# The review question this arm answers: the repository freezes the whole feature extractor and
+# trains 26.5 M parameters entirely after it, while ViPT/SDSTrack freeze the pretrained weights and
+# still inject trainable capacity inside every block.  Those are not the same configuration, and if
+# the correction module shows no benefit one live explanation is that the representation it operates
+# on cannot be adapted.  This config changes one variable -- the adapter -- and nothing else.
+#
+# Paired arms (all four trained at the same budget and seed):
+#   F0  this file with model.lora.enabled=false, model.decoder_mode=off
+#   F1  this file with model.lora.enabled=false
+#   A0  this file with model.decoder_mode=off
+#   A1  this file
+#
+# `schedule: cosine` + `warmup_steps` follow the reviewer's recipe and are applied to *all four*
+# arms, including the frozen controls, so F0 is not comparable with the archived constant-rate
+# `ab_full`; the four arms are comparable with each other, which is what the contrast needs.
+_base_: lasher_vitb_corrupt.yaml
+
+model:
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 8.0
+    targets: [q, v]
+    per_modality: true
+    modalities: [rgb, tir]
+    blocks: all
+
+train:
+  schedule: cosine
+  warmup_steps: 300
+  max_steps: 6000
+  lr: 0.0001
+  lr_lora: 0.0001
+  weight_decay: 0.0001
+  amp: true
+  codec_warmup_epochs: 0
+  grad_diag_every: 1000

@@ -105,6 +105,21 @@ model:
   # the corruption density), so the syndrome head does NOT see it by default.  Any result
   # claiming the Tanner structure produced the syndrome must be measured with this false.
   syndrome_use_obs_energy: false
+  # ---- capacity location: low-rank adapters inside the frozen blocks ----------------
+  # Off by default.  With it on, the frozen pretrained attention projections gain a small
+  # trainable update on the Q and V slices (B zero-initialised, so step 0 is an exact identity
+  # and the adapted arm starts bit-identical to the frozen one).  This is the one variable the
+  # capacity-location experiment changes; see docs/results.md 6.27.4 and
+  # codetrack/models/backbone/lora.py for why a fused-projection adapter would be a different
+  # intervention.  rank 8 with per_modality true is 0.59 M parameters.
+  lora:
+    enabled: false
+    rank: 8
+    alpha: 8.0
+    targets: [q, v]
+    per_modality: true
+    modalities: [rgb, tir]
+    blocks: all
   head_type: CENTER
   head_channel: 256
   discrepancy: learned
@@ -148,6 +163,16 @@ train:
   codec_warmup_epochs: 1
   # every N steps, report cos(L_track, L_correct) on the shared blocks (0 = off)
   grad_diag_every: 0
+  # Adapter learning rate.  Unset means "same as train.lr", which keeps every earlier run's
+  # single-rate behaviour; the adapted arms set it explicitly because a 0.59 M adapter and a
+  # 26.5 M decoder cannot share one optimum.
+  lr_lora: 0.0001
+  # Learning-rate schedule.  "constant" is what every archived run used; "cosine" adds a linear
+  # warmup over `warmup_steps` and then a cosine decay to zero over `max_steps`.  Off by default
+  # so the historical arms stay comparable.
+  schedule: constant
+  warmup_steps: 0
+  max_steps: 6000
 
 loss:
   # L = L_track + 1.0 * L_detect + 2.0 * L_correct + 0.1 * L_identity
@@ -175,3 +200,19 @@ loss:
 
 eval:
   metrics: [pr, sr, npr]
+  # Inference-protocol switches.  Both default to the historical behaviour so every archived
+  # number stays reproducible; see docs/results.md 6.29 and tools/inference_protocol_audit.py.
+  #   crop_mapping: "_crop_square clamps the side to MAX_CROP_SIDE_FACTOR x the longer frame edge
+  #                 and pulls the centre onto the frame.  "assumed" maps the head's normalised box
+  #                 back with the REQUESTED geometry (the historical behaviour, wrong by exactly
+  #                 the clamp whenever one fires); "actual" uses the clamped geometry, which is
+  #                 what the model was actually given.  A no-op for healthy frames."
+  crop_mapping: assumed
+  #   score_window: "the centre head takes a global argmax of the score map, so a spurious
+  #                 response far from the previous position wins outright.  "hann" multiplies the
+  #                 map by a Hann window before the argmax (what OSTrack's window_influence does),
+  #                 biasing the choice towards the window centre.  Measured on clean frames it
+  #                 changes nothing, because the crop is already centred on the previous
+  #                 prediction -- the mechanism is covered by a unit test."
+  score_window: none
+  window_influence: 0.5

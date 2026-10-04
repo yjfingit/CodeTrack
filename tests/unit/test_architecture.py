@@ -1077,3 +1077,124 @@ def test_identity_residual_zeroes_a_non_finite_step_and_counts_it():
     healthy = torch.randn(2, decoder.num_variables, 64)
     decoder._step(healthy)
     assert decoder.nonfinite_steps == 1
+
+
+# --------------------------------------------------- capacity location (LoRA in the blocks)
+
+
+def _tiny_backbone(lora=None):
+    """A 2-block backbone with deterministic weights, so arms can be compared exactly."""
+    from codetrack.models.backbone.vit import SharedViTBackbone
+
+    return SharedViTBackbone(search_size=64, template_size=32, patch_size=16, embed_dim=64,
+                             depth=2, num_heads=4, pretrain_img_size=32, return_stages=(0, 1),
+                             freeze=True, tir_from_rgb=True, lora=lora)
+
+
+def _tiny_pair_inputs():
+    return ((torch.randn(1, 3, 32, 32), torch.randn(1, 3, 64, 64)),
+            (torch.randn(1, 1, 32, 32), torch.randn(1, 1, 64, 64)))
+
+
+def test_lora_is_an_exact_identity_at_init_and_leaves_the_rng_stream_alone():
+    """Two properties the capacity-location comparison depends on.
+
+    B is zero-initialised, so the adapter contributes nothing at step 0 and the adapted arm starts
+    bit-identical to the frozen one.  And the adapter's own init must not draw from the *global*
+    RNG: if it did, every CodeTrack module built after the backbone would receive different
+    initial weights in the adapted arm, so F0/F1/A0/A1 would differ in two things instead of one.
+    """
+    from codetrack.models.backbone.build import lora_kwargs
+
+    torch.manual_seed(1234)
+    frozen = _tiny_backbone(None).eval()
+    torch.manual_seed(1234)
+    adapted = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 4, "alpha": 4.0})).eval()
+
+    frozen_params = dict(frozen.named_parameters())
+    adapted_params = dict(adapted.named_parameters())
+
+    def adapted_name(name: str) -> str:
+        # the wrapper nests the pretrained projection one level deeper; every other name is
+        # unchanged, and ``load_ostrack_pretrained`` aliases the checkpoint keys back
+        return (name.replace(".attn.qkv.", ".attn.qkv.base.")
+                if ".attn.qkv." in name else name)
+
+    assert all(adapted_name(name) in adapted_params for name in frozen_params), \
+        "the adapter must add tensors and rename only the wrapped projection"
+    for name, param in frozen_params.items():
+        assert torch.equal(param, adapted_params[adapted_name(name)]), \
+            f"{name} differs: the adapter init shifted the global RNG"
+
+    rgb, tir = _tiny_pair_inputs()
+    with torch.no_grad():
+        a, b = frozen(rgb, tir), adapted(rgb, tir)
+    for key, value in a.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(value, b[key]), f"{key}: the adapter is not an identity at init"
+
+    assert adapted.lora_parameter_count() > 0
+    assert all(p.requires_grad for p in adapted._lora_parameters())
+    # rank 4, 2 targets, 2 modalities, 2 blocks: 2 * 2 * (4*64 + 64*4) per block
+    assert adapted.lora_parameter_count() == 2 * 2 * 2 * (4 * 64 + 64 * 4)
+
+
+def test_lora_actually_moves_the_output_after_a_step():
+    """The identity at init must not be the whole story: a gradient step has to change the
+    backbone's output, otherwise the arm would be the frozen one with extra dead parameters."""
+    from codetrack.models.backbone.build import lora_kwargs
+
+    adapted = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 4, "alpha": 4.0})).eval()
+    rgb, tir = _tiny_pair_inputs()
+    before = adapted(rgb, tir)
+    optimizer = torch.optim.SGD([p for p in adapted.parameters() if p.requires_grad], lr=0.5)
+    loss = sum(v.float().pow(2).mean() for v in before.values() if isinstance(v, torch.Tensor))
+    loss.backward()
+    optimizer.step()
+    after = adapted(rgb, tir)
+    assert not all(torch.equal(before[k], after[k]) for k in before
+                   if isinstance(before[k], torch.Tensor))
+
+
+def test_freeze_backbone_keeps_adapters_trainable():
+    """`freeze_backbone()` must not silently turn the adapted arm into the frozen one: an arm whose
+    adapter never receives a gradient is the exact confusion this whole experiment exists to
+    avoid."""
+    from codetrack.models.backbone.build import lora_kwargs
+
+    adapted = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 4}))
+    adapted.freeze_backbone()
+    assert adapted.frozen is True
+    lora = adapted._lora_parameters()
+    assert lora and all(p.requires_grad for p in lora)
+    pretrained_trainable = [name for name, p in adapted.named_parameters()
+                            if p.requires_grad and name not in
+                            {n for n, _ in ((f"x{i}", q) for i, q in enumerate(lora))}
+                            and ".lora_a." not in name and ".lora_b." not in name]
+    assert pretrained_trainable == []
+
+    adapted.unfreeze_backbone()
+    assert all(p.requires_grad for p in adapted.parameters())
+
+
+def test_lora_rank_and_modality_routing_change_the_parameter_count():
+    from codetrack.models.backbone.build import lora_kwargs
+
+    per_modality = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 8}))
+    shared = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 8, "per_modality": False}))
+    wider = _tiny_backbone(lora_kwargs({"enabled": True, "rank": 16}))
+
+    assert per_modality.lora_parameter_count() == 2 * shared.lora_parameter_count()
+    assert wider.lora_parameter_count() == 2 * per_modality.lora_parameter_count()
+    with pytest.raises(ValueError, match="per-modality"):
+        per_modality.blocks[0].attn.qkv.delta(torch.randn(1, 4, 64), modality=None)
+
+
+def test_lora_disabled_reproduces_the_frozen_backbone_parameter_names():
+    """With the adapter off the module must not exist at all -- not merely be inactive -- so the
+    state dict keys and the pretrained loading path stay exactly as they were."""
+    plain = _tiny_backbone(None)
+    names = set(dict(plain.named_parameters()))
+    assert "blocks.0.attn.qkv.weight" in names
+    assert not any(".lora_" in name for name in names)
+    assert plain.lora_parameter_count() == 0

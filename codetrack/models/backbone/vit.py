@@ -27,7 +27,7 @@ Tensor shapes with the reference configuration (search 256, template 128, patch 
 from __future__ import annotations
 
 from functools import partial
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,26 +38,40 @@ try:  # timm >= 0.9
 except ImportError:  # pragma: no cover - legacy timm
     from timm.models.layers import DropPath, Mlp, trunc_normal_
 
+from .lora import LoRAQKV
 from .patch_embed import PatchEmbed
 
 
 class Attention(nn.Module):
-    """Multi-head self attention, identical to OSTrack / timm ViT."""
+    """Multi-head self attention, identical to OSTrack / timm ViT.
 
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    ``qkv`` may be wrapped by :class:`~codetrack.models.backbone.lora.LoRAQKV`, in which case the
+    forward takes the stream's ``modality`` so a per-modality adapter can be selected.  With the
+    default (no adapter) the call is exactly `self.qkv(x)`.
+    """
+
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
+                 lora: Optional[dict] = None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if lora:
+            self.qkv = LoRAQKV(self.qkv, **lora)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, return_attention=False):
+    @property
+    def lora_enabled(self) -> bool:
+        return isinstance(self.qkv, LoRAQKV)
+
+    def forward(self, x, return_attention=False, modality: Optional[str] = None):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv_out = (self.qkv(x, modality) if self.lora_enabled else self.qkv(x))
+        qkv = qkv_out.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -77,24 +91,25 @@ class Block(nn.Module):
     """Pre-norm transformer block, identical to OSTrack."""
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True, drop=0.,
-                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 lora: Optional[dict] = None):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop)
+                              attn_drop=attn_drop, proj_drop=drop, lora=lora)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
                        act_layer=act_layer, drop=drop)
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x, return_attention=False, modality: Optional[str] = None):
         if return_attention:
-            feat, attn = self.attn(self.norm1(x), True)
+            feat, attn = self.attn(self.norm1(x), True, modality)
             x = x + self.drop_path(feat)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
             return x, attn
 
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.attn(self.norm1(x), modality=modality))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -127,7 +142,8 @@ class SharedViTBackbone(nn.Module):
                  pretrain_img_size: int = 224,
                  return_stages: Iterable[int] = (2, 5),
                  freeze: bool = True,
-                 tir_from_rgb: bool = True):
+                 tir_from_rgb: bool = True,
+                 lora: Optional[dict] = None):
         super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
@@ -153,9 +169,11 @@ class SharedViTBackbone(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.lora_cfg = dict(lora) if lora else None
         self.blocks = nn.Sequential(*[
             Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-                  drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                  drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                  lora=self.lora_cfg)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -211,6 +229,12 @@ class SharedViTBackbone(nn.Module):
         The figure marks the transformer as *Frozen*; the tap norms were CodeTrack
         additions, but leaving 0.003 M trainable inside a "frozen" backbone is exactly
         the kind of detail a reviewer pokes at, so they are frozen too.
+
+        **LoRA parameters are deliberately excluded.**  They live inside the blocks but they are
+        not pretrained weights: freezing them would silently turn the adapted arm into the frozen
+        one while the config still claimed an adapter was installed, which is the failure mode the
+        whole arm exists to rule out.  ``_lora_parameters`` is the single place that decision is
+        made, and a test pins it.
         """
         for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks,
                        self.norm, self.inter_norms):
@@ -218,7 +242,16 @@ class SharedViTBackbone(nn.Module):
                 p.requires_grad = False
         for p in (self.pos_embed, self.pos_embed_z, self.pos_embed_x):
             p.requires_grad = False
+        for p in self._lora_parameters():
+            p.requires_grad = True
         self.frozen = True
+
+    def _lora_parameters(self) -> list:
+        return [p for name, p in self.named_parameters()
+                if ".lora_a." in name or ".lora_b." in name]
+
+    def lora_parameter_count(self) -> int:
+        return sum(p.numel() for p in self._lora_parameters())
 
     def unfreeze_backbone(self) -> None:
         for module in (self.patch_embed_rgb, self.patch_embed_tir, self.blocks,
@@ -266,7 +299,9 @@ class SharedViTBackbone(nn.Module):
 
         inter: Dict[str, torch.Tensor] = {}
         for i, blk in enumerate(self.blocks):
-            tokens = blk(tokens)
+            # the modality picks the LoRA variant when adapters are installed; with none, the
+            # argument is ignored and the arithmetic is exactly `blk(tokens)`
+            tokens = blk(tokens, modality=modality)
             if return_inter and i in self.return_stages:
                 inter[f"block{i}"] = self.inter_norms[str(i)](tokens)
 

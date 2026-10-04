@@ -42,7 +42,30 @@ def build_backbone(cfg: Dict[str, Any]) -> SharedViTBackbone:
         return_stages=b.get("return_stages", (2, 5)),
         freeze=b.get("freeze", True),
         tir_from_rgb=b.get("tir_from_rgb", True),
+        lora=lora_kwargs(b.get("lora")),
     )
+
+
+def lora_kwargs(section: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Translate the ``model.lora`` config block into :class:`LoRAQKV` keyword arguments.
+
+    Returns ``None`` when the adapter is off, which is the default: that keeps the backbone's
+    state dict and its arithmetic exactly as they were before adapters existed (AGENTS.md rule 3).
+    """
+    if not section or not bool(section.get("enabled", False)):
+        return None
+    blocks = section.get("blocks")
+    if blocks not in (None, "all"):
+        # Accepted in the config for documentation, but the implementation installs on every
+        # block; refusing an explicit subset beats silently ignoring it.
+        raise ValueError("model.lora.blocks currently supports only 'all'")
+    return {
+        "rank": int(section.get("rank", 8)),
+        "alpha": float(section.get("alpha", 8.0)),
+        "targets": tuple(section.get("targets", ("q", "v"))),
+        "per_modality": bool(section.get("per_modality", True)),
+        "modalities": tuple(section.get("modalities", ("rgb", "tir"))),
+    }
 
 
 def _extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
@@ -88,6 +111,19 @@ def load_ostrack_pretrained(backbone: SharedViTBackbone,
         if k in ("dist_token", "cls_token"):
             continue  # unused by the tracker
         remapped[k] = value
+
+    # When LoRA is installed the attention projection is a *wrapper* around the pretrained
+    # `nn.Linear`, so its parameters live at `...attn.qkv.base.weight` instead of
+    # `...attn.qkv.weight`.
+    # Without this remap the checkpoint's attention weights would silently not load and the
+    # "frozen pretrained backbone" would be a randomly initialised one.  The adapter's own
+    # `lora_a`/`lora_b` tensors have no counterpart in the OSTrack checkpoint, which is correct.
+    own_keys = set(backbone.state_dict().keys())
+    if any(k.endswith(".attn.qkv.base.weight") for k in own_keys):
+        for key in [k for k in remapped if ".attn.qkv." in k and ".qkv.base." not in k]:
+            aliased = key.replace(".attn.qkv.", ".attn.qkv.base.")
+            if aliased in own_keys:
+                remapped[aliased] = remapped[key]
 
     own_keys = set(backbone.state_dict().keys())
     loadable = {k: v for k, v in remapped.items() if k in own_keys}

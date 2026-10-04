@@ -61,6 +61,17 @@ class CenterPredictor(nn.Module):
         self.register_buffer("coord_x", coord_x)
         self.register_buffer("coord_y", coord_y)
 
+        # Optional inference-time score-map window (OSTrack applies a Hann window with a
+        # `window_influence` before the argmax; this head does not).  Registered as a buffer so it
+        # follows the module's device, and gated so the default path is bit-identical: the window
+        # changes which cell wins the argmax, so it is an inference-protocol choice, not a
+        # numerical detail.  See `eval.score_window` and docs/results.md 6.29.
+        self.score_window = "none"
+        self.window_influence = 0.5
+        window = torch.outer(torch.hann_window(self.feat_sz, periodic=False),
+                             torch.hann_window(self.feat_sz, periodic=False))
+        self.register_buffer("hann_window", window.view(1, 1, self.feat_sz, self.feat_sz))
+
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
@@ -73,6 +84,15 @@ class CenterPredictor(nn.Module):
         return score_map_ctr, bbox, size_map, offset_map
 
     def cal_bbox(self, score_map_ctr, size_map, offset_map, return_score=False):
+        if self.score_window == "hann":
+            # The centre head picks the global argmax of the score map, so a spurious high response
+            # far from the previous position wins outright.  A Hann window biases the choice
+            # towards the middle of the window (where the target was when the crop was taken), which
+            # is what OSTrack's `window_influence` does.  Applied here rather than in `forward` so
+            # the *returned* `score_map_ctr` keeps its semantics.
+            score_map_ctr = (score_map_ctr * (1.0 - self.window_influence)
+                             + self.hann_window.to(score_map_ctr.dtype)
+                             * self.window_influence)
         max_score, idx = torch.max(score_map_ctr.flatten(1), dim=1, keepdim=True)
         idx_y = idx // self.feat_sz
         idx_x = idx % self.feat_sz

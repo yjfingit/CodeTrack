@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..utils.runtime import CPU_THREAD_SETTINGS
 
@@ -184,11 +185,10 @@ class Trainer:
         ).to(self.device)
 
         # built after the loss module: the optimizer owns both parameter sets
-        self.optimizer = torch.optim.AdamW(
-            self._optim_parameters(),
-            lr=float(train_cfg.get("lr", 1e-4)),
-            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-        )
+        # Parameter *groups*, so an adapter can have its own learning rate and so norms/biases
+        # are not weight-decayed.  With no adapter installed this is one decayed group plus one
+        # undecayed group, which is the only change from the single-group builds of earlier runs.
+        self.optimizer = torch.optim.AdamW(self._optim_parameter_groups())
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
 
         # ---- corruption + staged training schedule -----------------------------
@@ -197,6 +197,27 @@ class Trainer:
         self.use_clean_teacher = bool(loss_cfg.get("clean_teacher", self.use_corruption))
         self.warmup_epochs = int(train_cfg.get("codec_warmup_epochs", 0))
         self.grad_diag_every = int(train_cfg.get("grad_diag_every", 0))
+        # Inference-protocol switches, both defaulting to the historical behaviour so archived
+        # numbers stay reproducible (docs/results.md 6.29).
+        eval_cfg = self.cfg.get("eval", {}) or {}
+        self.crop_mapping = str(eval_cfg.get("crop_mapping", "assumed"))
+        if self.crop_mapping not in ("assumed", "actual"):
+            raise ValueError(f"unknown eval.crop_mapping {self.crop_mapping!r}")
+        self.score_window = str(eval_cfg.get("score_window", "none"))
+        if self.score_window not in ("none", "hann"):
+            raise ValueError(f"unknown eval.score_window {self.score_window!r}")
+        self.window_influence = float(eval_cfg.get("window_influence", 0.5))
+        head = getattr(self.model, "head", None)
+        if head is not None and hasattr(head, "score_window"):
+            head.score_window = self.score_window
+            head.window_influence = self.window_influence
+
+        # Learning-rate schedule, off by default so archived constant-rate runs stay comparable.
+        self.schedule = str(train_cfg.get("schedule", "constant"))
+        if self.schedule not in ("constant", "cosine"):
+            raise ValueError(f"unknown train.schedule {self.schedule!r}")
+        self.warmup_steps = int(train_cfg.get("warmup_steps", 0))
+        self.max_steps = int(train_cfg.get("max_steps", 6000))
         self.stage = ""
 
         self.dataset = None
@@ -231,24 +252,73 @@ class Trainer:
         """
         return list(self.model.trainable_parameters()) + list(self.loss_fn.parameters())
 
+    @staticmethod
+    def _is_lora(name: str) -> bool:
+        return ".lora_a." in name or ".lora_b." in name
+
+    def _optim_parameter_groups(self) -> List[Dict[str, Any]]:
+        """Parameter groups: adapters, decayed weights, and norms/biases.
+
+        Three groups rather than one because an adapter has to be able to move at a rate the rest
+        of the network would be destabilised by, and because weight decay on a LayerNorm gain or a
+        bias is a different (and usually unwanted) regulariser.  When no adapter is installed and
+        `train.lr_lora` is unset, the first group is empty and the result is the single-group
+        behaviour of every earlier run.
+        """
+        train_cfg = self.cfg.get("train", {}) or {}
+        base_lr = float(train_cfg.get("lr", 1e-4))
+        lora_lr = float(train_cfg.get("lr_lora", base_lr))
+        weight_decay = float(train_cfg.get("weight_decay", 1e-4))
+
+        lora, decay, no_decay = [], [], []
+        named = list(self.model.named_parameters())
+        named += [(f"loss_fn.{name}", p) for name, p in self.loss_fn.named_parameters()]
+        for name, param in named:
+            if not param.requires_grad:
+                continue
+            if self._is_lora(name):
+                lora.append(param)
+            elif param.dim() >= 2:
+                decay.append(param)
+            else:
+                no_decay.append(param)
+
+        groups: List[Dict[str, Any]] = []
+        if lora:
+            groups.append({"params": lora, "lr": lora_lr, "weight_decay": weight_decay,
+                           "name": "lora"})
+        if decay:
+            groups.append({"params": decay, "lr": base_lr, "weight_decay": weight_decay,
+                           "name": "decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0,
+                           "name": "no_decay"})
+        return groups
+
     def set_trainable(self, modules: Optional[set] = None) -> None:
         """Freeze every CodeTrack block outside ``modules`` (``None`` = all of them).
 
-        The backbone keeps its own (frozen) state.  The optimizer is rebuilt afterwards
-        because the parameter set changed.
+        The backbone keeps its own (frozen) state, *except* for adapter parameters: a codec
+        warm-up that trains only the codebook and decoder must not leave the adapters moving, so
+        they follow the same ``allow`` rule.  The optimizer is rebuilt afterwards because the
+        parameter set changed.
+
+        ``train_cfg`` is read here only to keep the rebuild in one place; the learning rates come
+        from :meth:`_optim_parameter_groups`.
         """
         for name, module in self.model.named_children():
             if name == "backbone":
+                if hasattr(module, "_lora_parameters"):
+                    for p in module._lora_parameters():
+                        p.requires_grad = modules is None
                 continue
             allow = modules is None or name in modules
             for p in module.parameters():
                 p.requires_grad = allow
-        train_cfg = self.cfg.get("train", {})
-        self.optimizer = torch.optim.AdamW(
-            self._optim_parameters(),
-            lr=float(train_cfg.get("lr", 1e-4)),
-            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-        )
+        # Parameter *groups*, so an adapter can have its own learning rate and so norms/biases
+        # are not weight-decayed.  With no adapter installed this is one decayed group plus one
+        # undecayed group, which is the only change from the single-group builds of earlier runs.
+        self.optimizer = torch.optim.AdamW(self._optim_parameter_groups())
 
     def _corruption_cfg(self) -> Optional[Dict[str, Any]]:
         if not self.use_corruption:
@@ -361,6 +431,28 @@ class Trainer:
         return diag
 
     # ------------------------------------------------------------------- train
+    def _apply_lr_schedule(self, step: int) -> None:
+        """Warm up then cosine-decay every parameter group, preserving its own base rate.
+
+        Off by default (`train.schedule="constant"`), because every archived run used a constant
+        rate and a silently introduced schedule would make the new arms incomparable with them.
+        The adapted arms ask for it explicitly: a 0.59 M adapter and a 26.5 M decoder cannot share
+        a single optimum, and the reviewer's recipe for both calls for warmup + cosine.
+        """
+        total = max(1, self.max_steps or 1)
+        warmup = max(1, self.warmup_steps)
+        if step < warmup:
+            factor = float(step + 1) / float(warmup)
+        else:
+            progress = min(1.0, float(step - warmup) / float(max(1, total - warmup)))
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        for group in self.optimizer.param_groups:
+            base = group.get("base_lr")
+            if base is None:
+                base = group["lr"]
+                group["base_lr"] = base
+            group["lr"] = base * factor
+
     def train(self, max_iters: Optional[int] = None) -> Dict[str, Any]:
         if self.loader is None:
             self.build_loader()
@@ -408,6 +500,8 @@ class Trainer:
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.trainable_parameters(), self.grad_clip)
+                if self.schedule != "constant":
+                    self._apply_lr_schedule(step)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
@@ -417,11 +511,17 @@ class Trainer:
                     if diag:
                         # The legacy prefix is kept verbatim so archived logs stay parseable; the
                         # weighted reading is appended, because the unweighted pair alone cannot
-                        # distinguish "repair is ineffective" from "repair is harmful".
-                        message = ("[grad] cos(L_track, L_correct) = %+.3f | |g_track| %.3f "
-                                   "| |g_correct| %.3f")
-                        values = [diag["grad_cos_track_correct"], diag["grad_norm_track"],
-                                  diag["grad_norm_correct"]]
+                        # distinguish "repair is ineffective" from "repair is harmful".  Both parts
+                        # are optional: with lambda_correct=0 the unweighted pair does not exist at
+                        # all, and indexing it unconditionally turned a lambda sweep into a crash.
+                        message = "[grad]"
+                        values: List[Any] = []
+                        if "grad_cos_track_correct" in diag:
+                            message += " cos(L_track, L_correct) = %+.3f | |g_track| %.3f"
+                            values += [diag["grad_cos_track_correct"], diag["grad_norm_track"]]
+                            if "grad_norm_correct" in diag:
+                                message += " | |g_correct| %.3f"
+                                values.append(diag["grad_norm_correct"])
                         if "grad_cos_track_aux_weighted" in diag:
                             message += (" | cos(L_track, g_aux) = %+.3f | |g_aux| %.3f "
                                         "| aux/track %.3f | cos(L_track, g_total) = %+.3f")
@@ -429,7 +529,8 @@ class Trainer:
                                        diag["grad_norm_aux_weighted"],
                                        diag["grad_aux_over_track"],
                                        diag["grad_cos_weighted_total"]]
-                        self.logger.info(message, *values)
+                        if values:
+                            self.logger.info(message, *values)
                 nonfinite = int(outputs.get("decoder_nonfinite_steps", 0) or 0)
                 if nonfinite and nonfinite != getattr(self, "_nonfinite_reported", 0):
                     self._nonfinite_reported = nonfinite
@@ -529,7 +630,7 @@ class Trainer:
         template_rgb = self._crop_resize(rgb0, t_cx, t_cy, t_side, template_size)
         template_tir = self._crop_resize(tir0, t_cx, t_cy, t_side, template_size)
 
-        from ..data.transforms.sample import to_tensor
+        from ..data.transforms.sample import crop_geometry, to_tensor
         tpl_rgb_t = to_tensor(template_rgb, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         tpl_tir_t = to_tensor(template_tir, 1, (0.449,), (0.226,))
 
@@ -572,6 +673,15 @@ class Trainer:
             crops_used.append(crop.astype(np.float32).copy())
             cx, cy = crop[0] + crop[2] / 2, crop[1] + crop[3] / 2
             side = float(np.sqrt(max(crop[2], 1) * max(crop[3], 1))) * sf
+            # `_crop_square` clamps the side and pulls the centre onto the frame, so the crop the
+            # model actually sees is not always the requested one.  The head predicts in the
+            # coordinates of the crop it was *given*, so mapping back with the requested geometry
+            # is wrong by exactly the clamp whenever one fires -- which is the diverged regime the
+            # clamp exists for.  `eval.crop_mapping="actual"` uses the clamped geometry; the
+            # default keeps the historical assumption so every archived number stays reproducible.
+            map_cx, map_cy, map_side = crop_geometry(cx, cy, side, frame_h, frame_w)
+            if self.crop_mapping != "actual":
+                map_cx, map_cy, map_side = cx, cy, side
             search_rgb = self._crop_resize(rgb, cx, cy, side, search_size)
             search_tir = self._crop_resize(tir, cx, cy, side, search_size)
 
@@ -608,9 +718,9 @@ class Trainer:
                 diag["syndrome_clean"].append(
                     clean_out["syndrome"].flatten(1)[0].float().cpu().numpy())
 
-            px = cx + (box[0] - 0.5) * side
-            py = cy + (box[1] - 0.5) * side
-            pw, ph = box[2] * side, box[3] * side
+            px = map_cx + (box[0] - 0.5) * map_side
+            py = map_cy + (box[1] - 0.5) * map_side
+            pw, ph = box[2] * map_side, box[3] * map_side
             prediction = np.array([px - pw / 2, py - ph / 2, pw, ph], dtype=np.float32)
             prediction, clamp_reasons = clamp_box(prediction, frame_w, frame_h)
             if clamp_reasons:

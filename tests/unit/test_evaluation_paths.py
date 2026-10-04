@@ -982,6 +982,67 @@ def test_load_checkpoint_refuses_a_decoder_output_mismatch(tmp_path):
         assert load_checkpoint(path, CodeTrack(cfg), map_location="cpu")["missing"] is not None
 
 
+def test_crop_mapping_uses_the_geometry_the_model_was_actually_given():
+    """`_crop_square` clamps the side and the centre, so the crop the model sees is not always the
+    one requested.  Mapping the head's normalised box back with the requested geometry is wrong by
+    exactly the clamp whenever one fires -- and the clamp only fires in the diverged regime, so the
+    error is invisible in every healthy run and appears precisely when it matters.  The flag keeps
+    the historical assumption available so archived numbers stay reproducible."""
+    from codetrack.data.transforms.sample import MAX_CROP_SIDE_FACTOR, crop_geometry
+
+    # healthy frame: no clamp, the two agree exactly
+    assert crop_geometry(320.0, 240.0, 100.0, 480, 640) == (320.0, 240.0, 100.0)
+
+    # a diverged side is clamped to MAX_CROP_SIDE_FACTOR x the longer edge
+    _, _, side = crop_geometry(320.0, 240.0, 99999.0, 480, 640)
+    assert side == MAX_CROP_SIDE_FACTOR * 640
+
+    # a centre outside the frame is pulled onto it (the historical mapping would keep it outside)
+    cx, cy, _ = crop_geometry(-500.0, 5000.0, 100.0, 480, 640)
+    assert (cx, cy) == (0.0, 480.0)
+
+    # and the loop only applies the clamped geometry when asked
+    cfg = {"model": {"embed_dim": 64, "depth": 2, "num_heads": 4, "patch_size": 16,
+                     "img_size": 64, "template_size": 32, "code_dim": 32, "check_dim": 16,
+                     "num_identity_tokens": 4, "num_parity_tokens": 4, "num_variable_nodes": 16,
+                     "num_graph_nodes": 8, "bp_iterations": 2, "h_links_per_check": 4,
+                     "graph_top_k": 4, "fpn_dim": 16, "return_stages": (0, 1),
+                     "head_type": "CENTER", "head_channel": 16, "freeze_backbone": True}}
+    from codetrack.engine.trainer import Trainer
+    assert Trainer(cfg, output_dir=Path("/tmp")).crop_mapping == "assumed"
+    cfg["eval"] = {"crop_mapping": "actual"}
+    assert Trainer(cfg, output_dir=Path("/tmp")).crop_mapping == "actual"
+    cfg["eval"] = {"crop_mapping": "sideways"}
+    with pytest.raises(ValueError, match="crop_mapping"):
+        Trainer(cfg, output_dir=Path("/tmp"))
+
+
+def test_score_window_suppresses_a_spurious_corner_peak():
+    """The centre head takes a global argmax, so a response at the corner of the window wins
+    outright -- the failure mode OSTrack's `window_influence` exists to prevent.  The switch must
+    actually change the argmax when a spurious peak is present, and must be off by default."""
+    from codetrack.models.head.center import CenterPredictor
+
+    head = CenterPredictor(inplanes=8, channel=8, feat_sz=4, stride=16)
+    assert head.score_window == "none"
+
+    score = torch.full((1, 1, 4, 4), 0.20)
+    score[0, 0, 0, 0] = 0.30          # spurious corner peak, above the centre response
+    score[0, 0, 2, 2] = 0.25
+    size = torch.zeros(1, 2, 16)
+    offset = torch.zeros(1, 2, 16)
+
+    without = head.cal_bbox(score.clone(), size, offset)
+    assert torch.allclose(without[0, :2], torch.zeros(2)), \
+        "without the window the corner peak must win, which is the failure being fixed"
+
+    head.score_window = "hann"
+    head.window_influence = 0.5
+    with_window = head.cal_bbox(score.clone(), size, offset)
+    assert torch.allclose(with_window[0, :2], torch.full((2,), 0.5)), \
+        "the Hann window must pull the choice back to the window centre"
+
+
 def test_load_checkpoint_refuses_a_decoder_state_mode_mismatch(tmp_path):
     """``decoder_state_mode`` changes the decoder's *function* while leaving every tensor in
     place, so a mismatched load cannot be detected from the state dict and silently evaluated a
@@ -1008,3 +1069,99 @@ def test_load_checkpoint_refuses_a_decoder_state_mode_mismatch(tmp_path):
         load_checkpoint(path, CodeTrack(base), map_location="cpu")
 
     assert load_checkpoint(path, CodeTrack(held_cfg), map_location="cpu")["missing"] is not None
+
+
+def _tiny_trainer_cfg(**train_overrides):
+    cfg = {"model": {"embed_dim": 64, "depth": 2, "num_heads": 4, "patch_size": 16,
+                     "img_size": 64, "template_size": 32, "code_dim": 32, "check_dim": 16,
+                     "num_identity_tokens": 4, "num_parity_tokens": 4, "num_variable_nodes": 16,
+                     "num_graph_nodes": 8, "bp_iterations": 2, "h_links_per_check": 4,
+                     "graph_top_k": 4, "fpn_dim": 16, "return_stages": (0, 1),
+                     "head_type": "CENTER", "head_channel": 16, "freeze_backbone": True},
+           "train": {"epochs": 1, "samples_per_epoch": 32, "lr": 1e-4, "weight_decay": 1e-4,
+                     "grad_clip": 1.0, "amp": False, "log_every": 1, "codec_warmup_epochs": 0,
+                     "batch_size": 2, "num_workers": 0, "grad_diag_every": 0, **train_overrides}}
+    return cfg
+
+
+def test_optimizer_groups_separate_adapters_and_do_not_decay_norms():
+    """An adapter has to be able to move at its own rate, and weight decay on a LayerNorm gain or a
+    bias is a different regulariser from weight decay on a weight matrix.  With no adapter the
+    adapter group must be absent, so archived single-rate runs are unchanged."""
+    from codetrack.engine.trainer import Trainer
+
+    plain = Trainer(_tiny_trainer_cfg(), output_dir=Path("/tmp"))
+    names = [group.get("name") for group in plain.optimizer.param_groups]
+    assert "lora" not in names
+    assert set(names) == {"decay", "no_decay"}
+    by_name = {group.get("name"): group for group in plain.optimizer.param_groups}
+    assert by_name["decay"]["weight_decay"] == 1e-4
+    assert by_name["no_decay"]["weight_decay"] == 0.0
+
+    cfg = _tiny_trainer_cfg(lr_lora=5e-4)
+    cfg["model"]["lora"] = {"enabled": True, "rank": 4, "alpha": 4.0}
+    adapted = Trainer(cfg, output_dir=Path("/tmp"))
+    by_name = {group.get("name"): group for group in adapted.optimizer.param_groups}
+    assert set(by_name) == {"lora", "decay", "no_decay"}
+    assert by_name["lora"]["lr"] == 5e-4
+    assert by_name["decay"]["lr"] == 1e-4
+    assert sum(p.numel() for p in by_name["lora"]["params"]) == \
+        adapted.model.backbone.lora_parameter_count() > 0
+
+
+def test_cosine_schedule_warms_up_then_decays_and_preserves_group_ratios():
+    from codetrack.engine.trainer import Trainer
+
+    cfg = _tiny_trainer_cfg(lr_lora=1e-3, schedule="cosine", warmup_steps=10, max_steps=100)
+    cfg["model"]["lora"] = {"enabled": True, "rank": 4}
+    trainer = Trainer(cfg, output_dir=Path("/tmp"))
+    groups = {group.get("name"): group for group in trainer.optimizer.param_groups}
+
+    trainer._apply_lr_schedule(0)
+    assert groups["lora"]["lr"] < 1e-3, "warmup must start below the base rate"
+    trainer._apply_lr_schedule(9)
+    assert abs(groups["lora"]["lr"] - 1e-3) < 1e-12, "warmup must reach the base rate"
+    # the ratio between groups is a property of the configuration, not of the schedule
+    assert abs(groups["lora"]["lr"] / groups["decay"]["lr"] - 10.0) < 1e-9
+    trainer._apply_lr_schedule(55)
+    mid = groups["lora"]["lr"]
+    trainer._apply_lr_schedule(78)
+    late = groups["lora"]["lr"]
+    trainer._apply_lr_schedule(100)
+    end = groups["lora"]["lr"]
+    assert 0.0 < late < mid < 1e-3, "cosine must decay monotonically"
+    assert end == 0.0, "a cosine decay to zero must actually reach zero at max_steps"
+    # a constant-rate configuration must never have its lr touched
+    constant = Trainer(_tiny_trainer_cfg(), output_dir=Path("/tmp"))
+    before = [g["lr"] for g in constant.optimizer.param_groups]
+    assert constant.schedule == "constant"
+    assert before == [g["lr"] for g in constant.optimizer.param_groups]
+
+
+def test_load_checkpoint_refuses_a_lora_mismatch(tmp_path):
+    """Two adapters of different rank have different state dicts, and because `lora_b` starts at
+    zero a mismatched load leaves it *randomly* initialised -- a random delta added to the frozen
+    backbone, which no metric would flag as impossible."""
+    from codetrack.engine.trainer import Trainer
+    from codetrack.utils.checkpoint import load_checkpoint, save_checkpoint
+
+    def build(rank, enabled=True):
+        cfg = _tiny_trainer_cfg()
+        cfg["model"]["lora"] = {"enabled": enabled, "rank": rank, "alpha": float(rank)}
+        trainer = Trainer(cfg, output_dir=Path("/tmp"))
+        return cfg, trainer.model
+
+    cfg, model = build(4)
+    path = tmp_path / "lora4.pth"
+    save_checkpoint(path, model, optimizer=None, epoch=0, cfg=cfg)
+
+    _, plain_model = build(4, enabled=False)
+    with pytest.raises(RuntimeError, match="model.lora.enabled"):
+        load_checkpoint(path, plain_model, map_location="cpu")
+
+    _, wide_model = build(8)
+    with pytest.raises(RuntimeError, match="model.lora.rank"):
+        load_checkpoint(path, wide_model, map_location="cpu")
+
+    _, same_model = build(4)
+    assert load_checkpoint(path, same_model, map_location="cpu")["missing"] is not None
