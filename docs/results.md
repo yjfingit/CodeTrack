@@ -1934,36 +1934,59 @@ quality even a mediator for tracking?  Neither earlier experiment ever handed th
 *repaired* token set -- both changed how hard the repair was asked to work.  Two train-free
 diagnostics now do the direct thing.
 
-Both are pilot-scale in this section (10 sequences x 60 frames from the 60-sequence split, one
-severity, one condition `tok_block_erase` at ratio 0.2 on both modalities, one seed); the
-60-sequence x 200-frame runs are queued and this section will be replaced by their numbers.
+One severity, one condition `tok_block_erase` at ratio 0.2 on both modalities, one seed.  6.28.1 is
+at full scale (60 sequences x 200 frames); 6.28.2's full run was still in flight when this section
+was written, so its numbers are the 10-sequence pilot and are labelled as such.
 
 #### 6.28.1 Is the target still in the window when the tracker loses it? (`tools/search_containment.py`)
 
 `Trainer.infer_sequence` records the box that drove each frame's crop, so containment, centre
 offset and window-to-object scale ratio are all computable per frame.  Containment alone is a weak
-instrument -- the crop square is four object-widths across, so the target stays "inside" it through
-a drift of more than one object width -- which is why the other two measures are reported with it.
+instrument -- the crop square starts four object-widths across, so the target stays "inside" it
+through a drift of more than one object width -- which is why the other two measures are reported
+with it.
 
-For the three pilot sequences that fail inside 60 frames:
+Full run: **60 sequences x 200 frames**, `outputs/search_containment_ab_full_v1.json`.
 
-| quantity (after the failure) | value |
-|---|---|
-| fraction of the ground-truth box inside the crop | **1.000** (3/3 sequences fully inside) |
-| centre offset, in crop sides | **0.205** (0.5 would put the target on the boundary) |
-| window side / object side | **5.08** (a correct prediction gives exactly 4.0) |
-| frames that are both on-centre and at the right scale | **88.3 %** |
+| quantity | `corrupt` (token block erasure, ratio 0.2) | `clean` |
+|---|---:|---:|
+| sequences failing inside the horizon | 75.0 % | 78.3 % |
+| free mean IoU / SR | 0.325 / 0.386 | 0.328 / 0.398 |
+| **oracle crop** mean IoU / SR | **0.773 / 0.952** | **0.787 / 0.957** |
+| **gain from perfect crop placement** | **+0.448 IoU** | **+0.459 IoU** |
+| containment after failure (median) | 0.784 | **0.483** |
+| failing sequences with the target still inside / now outside | **29 / 16** | **23 / 24** |
+| centre offset after failure (crop sides; 0.5 = on the boundary) | 0.320 | 0.532 |
+| window/object side ratio after failure (a correct prediction gives 4.0) | 5.77 | 3.57 |
+| frames both on-centre and at the right scale | 55.5 % | 53.0 % |
 
-So the target is **in the window, near the centre, at almost the intended scale**, and the tracker
-still fails.  And re-running the same condition with the crop schedule replaced by the lagged
-ground truth -- which changes *only* where the window points, leaving model, corruption and head
-untouched -- lifts mean IoU from **0.235 to 0.801** and SR from 0.272 to 0.978.
+"Oracle crop" re-runs the **same condition** with the crop schedule replaced by the lagged ground
+truth -- only where the window points changes; model, corruption and head are untouched.  The gap
+to `free` is therefore what perfect crop placement is worth, and it is worth about **+0.45 IoU and
++57 SR points** on *both* conditions.
 
-The failure is therefore not "the target left the frame": the window is roughly where it should be,
-the tracker's *box* is what has drifted, and the drift persists because the next crop is derived
-from the drifted box.  That is a within-window self-consistency failure, and the pilot reading is
-that **the search range is not the lever**, which is the opposite of what the failure statistics of
-6.17.1 suggest on their own.
+Three readings, and the first is the one that matters:
+
+* **Crop placement dwarfs everything the correction branch has been asked to do.**  No token-level
+  intervention measured anywhere in this document moves mean IoU by more than ~0.02; perfect crop
+  placement moves it by ~0.45.  Whatever limits this tracker, the crop is a far larger term than
+  the per-token repair.
+* **The failure mode is mixed, not uniform.**  After the failure the target is still wholly inside
+  the window on two thirds of the failing sequences under corruption, but on only half of them
+  under `clean`; the median containment is 0.78 corrupted against 0.48 clean.  "The target left the
+  window" is real for a third to a half of failures and false for the rest, so neither a purely
+  local re-centring fix nor a purely global re-detection stage addresses all of it, and the choice
+  between them cannot be made from the failure statistics alone.
+* **This corruption condition does not degrade tracking at all**: 0.325 vs 0.328 mean IoU, 75.0 %
+  vs 78.3 % failure.  Token block erasure at ratio 0.2 on both modalities is simply not a condition
+  this checkpoint is sensitive to -- the same null as 6.16, and worth stating plainly because it
+  constrains what any robustness claim here could rest on.
+
+The 3-sequence pilot of this section reported containment 1.000 and read the failure as purely
+within-window.  That was a small-sample artefact and is corrected here.  The window-to-object ratio
+of 5.77 after failure is the second reason to distrust that reading: a window 5.8x the object is
+mostly background, so the head is asked to find a small target in a large field even when the
+containment measure says "inside".
 
 #### 6.28.2 Is a repaired token set a useful mediator? (`tools/token_oracle_interp.py`)
 

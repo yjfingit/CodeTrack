@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Any, Dict, Sequence
 
 import numpy as np
 
@@ -55,9 +55,22 @@ def normalized_precision(pred: np.ndarray, gt: np.ndarray, threshold: float = 0.
     return float((errors / norm <= threshold).mean())
 
 
-def summarize(results: Sequence[Dict[str, float]]) -> Dict[str, float]:
-    """Average per-sequence metrics into the standard PR / SR / NPR triple."""
+def summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+    """Average per-sequence metrics into the standard PR / SR / NPR triple.
+
+    Only *numeric* entries are averaged.  The per-sequence row also carries structured
+    diagnostics (for example ``box_clamps_by_reason``, a dict), and averaging those raises
+    ``TypeError: unsupported operand type(s) for +: 'dict' and 'dict'`` at the very end of a
+    60-sequence evaluation -- after all the GPU work, which is the worst place to lose it.  Adding
+    a field to the diagnostics should never be able to fail a run.
+    """
     if not results:
         return {"pr": 0.0, "sr": 0.0, "npr": 0.0}
     keys = results[0].keys()
-    return {k: float(np.mean([r[k] for r in results])) for k in keys}
+    out: Dict[str, float] = {}
+    for key in keys:
+        values = [r[key] for r in results if isinstance(r.get(key), (int, float, np.floating,
+                                                                    np.integer))]
+        if len(values) == len(results) and values:
+            out[key] = float(np.mean(values))
+    return out

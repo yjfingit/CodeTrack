@@ -1165,3 +1165,28 @@ def test_load_checkpoint_refuses_a_lora_mismatch(tmp_path):
 
     _, same_model = build(4)
     assert load_checkpoint(path, same_model, map_location="cpu")["missing"] is not None
+
+
+def test_summarize_ignores_structured_diagnostics_in_the_per_sequence_row():
+    """The per-sequence row carries structured diagnostics (``box_clamps_by_reason`` is a dict)
+    alongside the numeric metrics.  Averaging *every* key raised
+    ``TypeError: unsupported operand type(s) for +: 'dict' and 'dict'`` at the very end of a
+    60-sequence evaluation -- after all the GPU work.  Adding a diagnostic field must never be
+    able to fail a run, so only numeric entries are averaged."""
+    from codetrack.metrics import summarize
+
+    rows = [{"sr": 0.5, "pr": 0.4, "npr": 0.6, "frames": 200,
+             "box_clamps_by_reason": {"scale": 3, "center": 1}},
+            {"sr": 0.7, "pr": 0.6, "npr": 0.8, "frames": 200,
+             "box_clamps_by_reason": {"center": 2}}]
+    out = summarize(rows)
+    assert abs(out["sr"] - 0.6) < 1e-12
+    assert abs(out["pr"] - 0.5) < 1e-12
+    assert out["frames"] == 200.0
+    assert "box_clamps_by_reason" not in out
+
+    # a key present on only some rows must not be averaged over the wrong denominator
+    rows[1].pop("npr")
+    partial = summarize(rows)
+    assert "npr" not in partial and "sr" in partial
+    assert summarize([]) == {"pr": 0.0, "sr": 0.0, "npr": 0.0}
